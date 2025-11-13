@@ -1,0 +1,7 @@
+[target.armv7-unknown-linux-musleabihf]
+linker = "armv7l-linux-gnueabihf-gcc"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=cortex-a7"]
+
+[env]
+CC_armv7_unknown_linux_musleabihf = "armv7l-linux-gnueabihf-gcc"
+AR_armv7_unknown_linux_musleabihf = "armv7l-linux-gnueabihf-ar"
