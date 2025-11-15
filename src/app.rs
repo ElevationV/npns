@@ -1,14 +1,18 @@
 #![allow(dead_code)]
 
-use std::path::{PathBuf};
+use std::borrow::Cow;
+use std::fs::metadata;
+use std::path::PathBuf;
+use std::os::unix::fs::FileTypeExt;
 use anyhow::Result;
-use std::io::{Stdout};
+use std::io::Stdout;
 use crate::fs_info::file_system_info::{FileSys, StatusFlag};
+use crate::fs_info::file_info::FileInfo;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Paragraph, Table, Row, Cell, TableState},
     Frame, Terminal,
@@ -21,54 +25,43 @@ enum InputContext {
     NewDir,
     Rename,
     ConfirmDelete,
+    Search,
 }
 
 pub struct App {
     fs: FileSys,
-    table_state: TableState,
+    table_state: TableState, // cursor index
     input_context: InputContext,
     input_buffer: String,
+    show_hidden: bool,
+    search_query: String,
     should_quit: bool,
 }
 
 impl App {
-    pub fn new(start_dir: PathBuf) -> Result<Self> {
-        let mut app = App {
+    pub fn new(start_dir: PathBuf) -> Result<App> {
+        let app = App{
             fs: FileSys::init(start_dir)?,
             table_state: TableState::default(),
             input_context: InputContext::None,
             input_buffer: String::new(),
+            show_hidden: false,
+            search_query: String::new(),
             should_quit: false,
         };
-        app.table_state.select(Some(0));
         Ok(app)
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
-            terminal.draw(|f| self.ui(f))?;
+            terminal.draw(|frame| self.ui(frame))?;
+
             if self.should_quit {
-                return Ok(());
+                return Ok(())
             }
-            match event::read() {
-                Ok(Event::Key(key)) => {
-                    if key.kind == KeyEventKind::Press {
-                        let _ = self.handle_key(key.code);
-                    }
-                }
-                Ok(Event::Mouse(_)) => {
-                    continue;
-                }
-                Ok(Event::Resize(_, _)) => {
-                    continue;
-                }
-                Ok(_) => {
-                    continue;
-                }
-                Err(e) => {
-                    self.fs.status_info = format!("Event error (ignored): {}", e);
-                    self.fs.status_flag = StatusFlag::Others;
-                    continue;
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.kind == KeyEventKind::Press {
+                    let _ = self.handle_key(key.code);
                 }
             }
         }
@@ -76,252 +69,379 @@ impl App {
 
     fn handle_key(&mut self, key: KeyCode) -> Result<()> {
         if self.input_context != InputContext::None {
-            match key {
-                KeyCode::Char('y') | KeyCode::Char('Y') if self.input_context == InputContext::ConfirmDelete => {
-                    self.fs.delete_selected()?;
-                    self.cancel_input();
-                }
+            self.handle_input_mode(key)
+        } else {
+            self.handle_normal_mode(key)
+        }
+    }
 
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if self.input_context == InputContext::ConfirmDelete => {
-                    self.cancel_input();
-                    self.fs.status_info = "Delete cancelled".to_string();
-                }
-                KeyCode::Char('q') => self.cancel_input(),
-                KeyCode::Char(c) => self.input_buffer.push(c),
-                KeyCode::Enter => {
-                    let input = self.input_buffer.trim().to_string();
-                    if !input.is_empty() {
-                        let result = match self.input_context {
-                            InputContext::NewFile => self.fs.new_file(&input, false),
-                            InputContext::NewDir => self.fs.new_file(&input, true),
-                            InputContext::Rename => self.fs.rename_selected(&input),
-                            InputContext::ConfirmDelete => {
-                                self.fs.delete_selected()?;
-                                self.cancel_input();
-                                return Ok(());
-                            }
-                            InputContext::None => Ok(()),
-                        };
+    ///
+    /// # Key Handler in Input Mod
+    ///
 
-                        if let Err(e) = result {
-                            self.fs.status_info = format!("Error: {}", e);
-                            self.fs.status_flag = StatusFlag::Error;
-                        }
-                    }
-                    self.cancel_input();
-                }
-                KeyCode::Backspace => { self.input_buffer.pop(); }
-                _ => {}
+    fn handle_input_mode(&mut self, key: KeyCode) -> Result<()> {
+        match key {
+            KeyCode::Char(c) => self.input_buffer.push(c),
+            KeyCode::Backspace => {self.input_buffer.pop();},
+            KeyCode::Enter => self.submit_input()?,
+            KeyCode::Esc => self.exit_input_mode(),
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn submit_input(&mut self) -> Result<()> {
+        let input = self.input_buffer.trim().to_string();
+
+        if self.input_context == InputContext::Search {
+            self.search_query = input;
+            self.reset_cursor();
+            self.clear_selection();
+            self.exit_input_mode();
+            return Ok(());
+        }
+        if self.input_context == InputContext::ConfirmDelete {
+            if input == 'y'.to_string() || input == 'Y'.to_string() {
+                self.fs.delete_selected()?;
+                self.exit_input_mode();
+            } else if input == 'n'.to_string() || input == 'N'.to_string() {
+                self.exit_input_mode();
             }
+
             return Ok(());
         }
 
-        let current_idx = match self.table_state.selected() {
-            Some(i) if i < self.fs.files().len() => i,
-            _ => return Ok(()),
-        };
+        if !input.is_empty() {
+            let result = match self.input_context {
+                InputContext::NewFile => self.fs.new_file(&input, false),
+                InputContext::NewDir => self.fs.new_file(&input, true),
+                InputContext::Rename => self.fs.rename_selected(&input),
+                _ => Ok(())
+            };
 
-        let _ = match key {
-            KeyCode::Char('k') => self.next_row(),
-            KeyCode::Char('j') => self.previous_row(),
-            KeyCode::Char('l') | KeyCode::Enter => {
-                self.fs.select_current(current_idx);
-                if self.fs.files().get(current_idx).unwrap().is_dir {
-                    self.fs.sub_dir(current_idx)?;
-                    self.table_state.select(Some(0));
-                    Ok(())
-                } else {
-                    Ok(())
-                }
+            if let Err(error) = result {
+                self.fs.status_info = format!("Error: {}", error);
+                self.fs.status_flag = StatusFlag::Error;
             }
-            KeyCode::Char('h') => self.fs.parent_dir(),
-            KeyCode::Char(' ') => {
-                self.fs.select_current(current_idx);
-                Ok(())
-            }
-            KeyCode::Char('c') => self.fs.copy_selected(true),
-            KeyCode::Char('x') => self.fs.copy_selected(false),
-            KeyCode::Char('v') => self.fs.paste(),
-            KeyCode::Char('d') => {
-                self.input_context = InputContext::ConfirmDelete;
-                self.input_buffer.clear();
-                self.fs.status_info = "Removed files cannot recover (y/N): ".to_string();
-                self.fs.status_flag = StatusFlag::Others;
-                Ok(())
-            }
-            KeyCode::Char('u') => self.fs.undo(),
-            KeyCode::Char('n') => self.start_input(false),
-            KeyCode::Char('m') => self.start_input(true),
-            KeyCode::Char('r') => self.start_rename(current_idx),
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                Ok(())
-            },
-            _ => Ok(()),
-        };
-        Ok(())
-    }
-
-    fn previous_row(&mut self) -> Result<()> {
-        let i = match self.table_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.fs.files().len().saturating_sub(1)
-                } else {
-                    i.saturating_sub(1)
-                }
-            }
-            None => 0,
-        };
-        self.table_state.select(Some(i));
-        Ok(())
-    }
-
-    fn next_row(&mut self) -> Result<()> {
-        let i = match self.table_state.selected() {
-            Some(i) => {
-                if i >= self.fs.files().len().saturating_sub(1) {
-                    0
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.table_state.select(Some(i));
-        Ok(())
-    }
-
-    fn start_input(&mut self, is_dir: bool) -> Result<()> {
-        self.input_context = if is_dir {
-            InputContext::NewDir
-        } else {
-            InputContext::NewFile
-        };
-        self.input_buffer.clear();
-        self.fs.status_info = format!("Enter {} name:", if is_dir { "directory" } else { "file" });
-        self.fs.status_flag = StatusFlag::Input;
-        Ok(())
-    }
-
-    fn start_rename(&mut self, current_idx: usize) -> Result<()> {
-        let file_name = self.fs.files().get(current_idx).map(|f| f.name.clone());
-        if let Some(name) = file_name {
-            self.fs.selected_index = Some(current_idx);
-            self.input_buffer = name;
-            self.input_context = InputContext::Rename;
-            self.fs.status_info = "Enter new name:".to_string();
-            self.fs.status_flag = StatusFlag::Input;
         }
+
+        self.exit_input_mode();
         Ok(())
     }
-    fn cancel_input(&mut self) {
+
+    // clear input buffer and flags
+    fn exit_input_mode(&mut self) {
         self.input_context = InputContext::None;
         self.input_buffer.clear();
         self.fs.status_info = "Ready".to_string();
         self.fs.status_flag = StatusFlag::Ready;
     }
 
-    fn ui(&mut self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(2)
-            .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
-            .split(f.area());
+    ///
+    /// # Key Handler in Normal Mode
+    ///
+    fn handle_normal_mode(&mut self, key: KeyCode) -> Result<()> {
+        match key {
+            // guide
+            KeyCode::Char('j') => self.move_cursor(-1),
+            KeyCode::Char('k') => self.move_cursor(1),
+            KeyCode::Char('h') => self.go_parent_dir(),
+            KeyCode::Char('l') => self.enter_current(),
 
-        self.render_and_display_table(f, chunks[0]);
+            // selection
+            KeyCode::Char(' ') => self.toggle_selection(),
 
-        let status_style = match self.input_context {
-            InputContext::ConfirmDelete => Style::default().fg(Color::Magenta),  // 品红色 for ConfirmDelete
-            _ => match self.fs.status_flag {
-                StatusFlag::Error => Style::default().fg(Color::Red),
-                StatusFlag::Ready => Style::default().fg(Color::Green),
-                StatusFlag::Input => Style::default().fg(Color::Yellow),
-                _ => Style::default(),
-            },
-        };
+            // file operations
+            KeyCode::Char('c') => self.fs.copy_selected(true),
+            KeyCode::Char('x') => self.fs.copy_selected(false),
+            KeyCode::Char('v') => self.fs.paste(),
+            KeyCode::Char('d') => self.start_delete_confirm(),
+            KeyCode::Char('u') => self.fs.undo(),
+            KeyCode::Char('r') => self.start_rename(),
 
-        if self.input_context != InputContext::None && self.input_context != InputContext::ConfirmDelete {
-            let input = Paragraph::new(self.input_buffer.as_str())
-                .block(Block::default().borders(Borders::ALL).title("Input"))
-                .style(Style::default().fg(Color::Yellow));
-            f.render_widget(input, chunks[1]);
-        } else {
-            let status_text = if self.input_context == InputContext::ConfirmDelete {
-                self.fs.status_info.as_str()
-            } else {
-                self.fs.status_info.as_str()
-            };
-            let status = Paragraph::new(status_text)
-                .block(Block::default().borders(Borders::ALL).title(if self.input_context == InputContext::ConfirmDelete { "Confirm Delete" } else { "Status" }))
-                .style(status_style);
-            f.render_widget(status, chunks[1]);
+            // create
+            KeyCode::Char('n') => self.start_new_file(),
+            KeyCode::Char('m') => self.start_new_dir(),
+
+            // filter or search
+            KeyCode::Char('.') => self.toggle_hidden_files(),
+            KeyCode::Char('/') => self.start_search(),
+            KeyCode::Esc => self.clear_search(),
+
+            // exit
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                Ok(())
+            }
+
+            _ => Ok(())
         }
     }
 
-    fn render_and_display_table(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header_style = Style::default().add_modifier(Modifier::BOLD);
-        let selected_style = Style::default().add_modifier(Modifier::REVERSED);
+    ///
+    /// # Guide
+    ///
+    fn move_cursor(&mut self, delta: i32) -> Result<()> {
+        let len = self.filtered_files().len();
+        if len == 0 {
+            self.table_state.select(None);
+            return Ok(())
+        }
 
-        let rows: Vec<Row> = self.fs.files().iter().enumerate().map(|(i, file)| {
-            let type_cell = if file.is_dir { "DIR" } else { "FILE" };
-            let size_str = if file.is_dir {
-                "-".to_string()
-            } else {
-                format_size(file.size)
-            };
+        let new_index = match self.table_state.selected() {
+            Some(i) => {
+                if delta > 0 {
+                    if i >= len - 1 { 0 } else { i + 1 }
+                } else {
+                    if i == 0 { len - 1 } else { i - 1 }
+                }
+            },
+            None => 0,
+        };
 
-            let style = if Some(i) == self.fs.selected_index() {
-                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+        self.table_state.select(Some(new_index));
+        Ok(())
+    }
+
+    fn go_parent_dir(&mut self) -> Result<()> {
+        self.fs.parent_dir()?;
+        self.clear_selection(); // clear selection
+        self.reset_cursor();    // clear cursor
+        Ok(())
+    }
+
+    fn enter_current(&mut self) -> Result<()> {
+        if let Some((original_index, is_dir)) = self.get_cursor_file_info() {
+            if is_dir {
+                self.fs.select_current(original_index);
+                self.fs.sub_dir(original_index)?;
+
+                self.search_query.clear();
+                self.clear_selection();
+                self.reset_cursor();
+            }
+        }
+
+        Ok(())
+    }
+
+    ///
+    /// # Select Operation
+    ///
+    fn toggle_selection(&mut self) -> Result<()> {
+        if let Some((original_index, _)) = self.get_cursor_file_info() {
+            if self.fs.selected_index() == Some(original_index) {
+                self.fs.selected_index = None;
             } else {
-                Style::default()
+                self.fs.selected_index = Some(original_index);
+            }
+        }
+        Ok(())
+    }
+    fn clear_selection(&mut self){
+        self.fs.selected_index = None;
+    }
+    fn reset_cursor(&mut self) {
+        // if nothing in current dir(after search), current index should be None
+        let filtered = self.filtered_files();
+        self.table_state.select(if filtered.is_empty() {None} else {Some(0)});
+    }
+
+    ///
+    /// # File Operation
+    ///
+    fn start_delete_confirm(&mut self) -> Result<()> {
+        if self.fs.selected_index.is_some(){
+            self.input_context = InputContext::ConfirmDelete;
+        } else {
+            self.exit_input_mode()
+        }
+        Ok(())
+    }
+
+    fn start_rename(&mut self) -> Result<()> {
+        if let Some((original_index, _)) = self.get_cursor_file_info() {
+            if let Some(file) = self.fs.files().clone().get(original_index) {
+                self.fs.selected_index = Some(original_index);
+                self.input_buffer = file.name.clone();
+                self.input_context = InputContext::Rename;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_new_file(&mut self) -> Result<()> {
+        self.input_context = InputContext::NewFile;
+        self.input_buffer.clear();
+        Ok(())
+    }
+
+    fn start_new_dir(&mut self) -> Result<()> {
+        self.input_context = InputContext::NewDir;
+        self.input_buffer.clear();
+        Ok(())
+    }
+
+    ///
+    /// # Search
+    ///
+    fn toggle_hidden_files(&mut self) -> Result<()> {
+        self.show_hidden = !self.show_hidden; // toggle status
+        self.search_query.clear();      // clear search buffer
+        self.reset_cursor();
+        Ok(())
+    }
+
+    fn start_search(&mut self) -> Result<()> {
+        self.input_context = InputContext::Search;
+        self.input_buffer.clear(); // set input flag
+        self.reset_cursor(); // clean search buffer
+        Ok(())
+    }
+
+    fn clear_search(&mut self) -> Result<()> {
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            self.reset_cursor();
+        }
+        Ok(())
+    }
+
+    ///
+    /// # UI
+    ///
+    fn ui(&mut self, frame: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(2)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(frame.area());
+
+        self.render_table(frame, chunks[0]);
+        self.render_status_bar(frame, chunks[1]);
+    }
+
+    fn render_table(&mut self, frame: &mut Frame, area: Rect) {
+        // only show filtered files
+        let table = self.filtered_files();
+
+        let rows: Vec<Row> = table.iter().map(|(index, file)| {
+            let style = if Some(*index) == self.fs.selected_index(){
+                Style::default().add_modifier(Modifier:: BOLD).fg(Color::Cyan) // selected
+            } else {
+                Style::default() // not selected
             };
 
             Row::new(vec![
                 Cell::from(file.name.clone()),
-                Cell::from(size_str),
-                Cell::from(type_cell),
+                Cell::from(if file.is_dir{"-".to_string()} else { format_file_size(file.size) }),
+                Cell::from(get_file_type(&file.path)),
             ]).style(style)
-        }).collect();
+        }).collect();// [file_name, file_size, file_type] + style(for selected)
 
-        let header = Row::new(vec![
-            Cell::from("Name"),
-            Cell::from("Size"),
-            Cell::from("Type"),
-        ]).style(header_style);
+        let mut title = self.fs.current_dir().display().to_string();
+        if !self.search_query.is_empty() { // when searching, title should change
+            title = format!("{} [Searching: '{}']", title, self.search_query);
+        }
 
-        let table = Table::new(
-            rows,
-            &[
-                Constraint::Min(30),
-                Constraint::Length(12),
-                Constraint::Length(6)
-            ]
-        )
-            .header(header)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(self.fs.current_dir().display().to_string())
-            )
-            .row_highlight_style(selected_style)
+        let table = Table::new(rows, [Constraint::Min(30), Constraint::Length(12), Constraint::Min(6)])
+            .header(Row::new(vec!["Name", "Size", "Type"]).style(Style::default().add_modifier(Modifier::BOLD)))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .column_spacing(1);
 
-        f.render_stateful_widget(table, area, &mut self.table_state);
+        frame.render_stateful_widget(table, area, &mut self.table_state);
+    }
+
+    fn render_status_bar(&mut self, frame: &mut Frame, area: Rect) {
+        let (title, content, color) = match self.input_context {
+            InputContext::Search =>
+                ("Search", Cow::Borrowed(self.input_buffer.as_str()), Color::Gray),
+            InputContext::ConfirmDelete =>
+                ("Confirm", Cow::Owned(format!("Removed files cannot recover (y/N): {}", self.input_buffer)), Color::Magenta),
+            InputContext::None => {
+                let mut text = self.fs.status_info.clone();
+                if !self.search_query.is_empty() {
+                    text = format!("{} | Search: '{}'", text, self.search_query);
+                }
+                if self.show_hidden {
+                    text = format!("{} | [Hidden Shown]", text);
+                }
+
+                let color = match self.fs.status_flag {
+                    StatusFlag::Error => Color::Red,
+                    StatusFlag::Ready => Color::Green,
+                    StatusFlag::Input => Color::Yellow,
+                    _ => Color::White,
+                };
+                ("Status", Cow::Owned(text), color)
+            }
+            _ => ("Input", Cow::Borrowed(self.input_buffer.as_str()), Color::Yellow),
+        };
+
+        let widget = Paragraph::new(content.as_ref())
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .style(Style::default().fg(color));
+        frame.render_widget(widget, area);
+    }
+
+    ///
+    /// # Helpers
+    ///
+
+    fn filtered_files(&self) -> Vec<(usize, &FileInfo)> { // (original_index, file_info)
+        // filter files, include hide and search
+        self.fs.files()
+            .iter()
+            .enumerate() // original index
+            .filter(|(_, file)| {
+                // hide
+                let show_file = self.show_hidden || !file.name.starts_with('.');
+                // search
+                let matches_search = self.search_query.is_empty()
+                    || file.name.to_lowercase().contains(&self.search_query.to_lowercase());
+                show_file && matches_search
+            })
+            .collect()
+    }
+
+    fn get_cursor_file_info(&self) -> Option<(usize, bool)> { // (original_index, is_dir)
+        let filtered = self.filtered_files(); // (original_index, file_info)
+        self.table_state.selected()
+            .and_then(|index| {filtered.get(index)})
+            .map(|(original_index, file)| (*original_index, file.is_dir))
     }
 }
 
-fn format_size(size: u64) -> String {
-    if size == 0 {
-        "0 B".to_string()
+fn format_file_size(size: u64) -> String {
+    if size == 0 { return "0 B".to_string(); }
+
+    let units = ["B", "KB", "MB", "GB"];
+    let mut value = size as f64;
+    let mut unit_idx = 0;
+
+    while value >= 1024.0 && unit_idx < units.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+
+    format!("{:.1} {}", value, units[unit_idx])
+}
+
+fn get_file_type(path: &PathBuf) -> &'static str {
+    if let Ok(metadata) = metadata(path) {
+        let file_type = metadata.file_type();
+
+        if file_type.is_dir() { "DIR" }
+        else if file_type.is_file() { "FILE" }
+        else if file_type.is_symlink() { "SYMLINK" }
+        else if file_type.is_fifo() { "FIFO" }
+        else if file_type.is_char_device() { "CHAR" }
+        else if file_type.is_block_device() { "BLOCK" }
+        else if file_type.is_socket() { "SOCKET" }
+        else { "UNKNOWN" }
     } else {
-        let units = ["B", "KB", "MB", "GB"];
-        let mut s = size as f64;
-        let mut unit_idx = 0;
-        while s >= 1024.0 && unit_idx < units.len() - 1 {
-            s /= 1024.0;
-            unit_idx += 1;
-        }
-        format!("{:.1} {}", s, units[unit_idx])
+        "ERROR"
     }
 }
