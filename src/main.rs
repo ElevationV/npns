@@ -1,7 +1,6 @@
 mod fs_info;
 mod app;
 
-use anyhow::Result;
 use std::io;
 use crate::app::App;
 
@@ -14,8 +13,7 @@ use ratatui::{
     Terminal,
 };
 
-
-fn main() -> Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_dir = std::env::current_dir()?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -27,10 +25,7 @@ fn main() -> Result<()> {
     let res = app.run(&mut terminal);
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     if let Err(err) = res {

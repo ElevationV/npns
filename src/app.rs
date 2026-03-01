@@ -1,22 +1,30 @@
 #![allow(dead_code)]
 
-use std::borrow::Cow;
 use std::fs::metadata;
+use std::io::Stdout;
 use std::path::PathBuf;
 use std::os::unix::fs::FileTypeExt;
-use anyhow::Result;
-use std::io::Stdout;
-use crate::fs_info::file_system_info::{FileSys, StatusFlag};
-use crate::fs_info::file_info::FileInfo;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph, Table, Row, Cell, TableState},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Cell, Table, TableState},
     Frame, Terminal,
 };
+
+use crate::fs_info::{
+    FileSystemCore,
+    DuplicatedFileHandleOps,
+    StateFlag,
+    FileInfo,
+};
+
+// Input context
 
 #[derive(PartialEq, Clone, Copy)]
 enum InputContext {
@@ -28,420 +36,753 @@ enum InputContext {
     Search,
 }
 
+// Duplicate dialog
+
+#[derive(PartialEq, Clone)]
+enum DuplicateDialogMode {
+    File,
+    Dir,
+}
+
+#[derive(Clone)]
+struct DuplicateDialog {
+    path: PathBuf,
+    mode: DuplicateDialogMode,
+    apply_to_all: bool,
+    cursor: usize,
+    rename_input: Option<String>,
+}
+
+impl DuplicateDialog {
+    fn new(path: PathBuf, is_dir: bool) -> Self {
+        DuplicateDialog {
+            path,
+            mode: if is_dir { DuplicateDialogMode::Dir } else { DuplicateDialogMode::File },
+            apply_to_all: false,
+            cursor: 0,
+            rename_input: None,
+        }
+    }
+
+    fn options(&self) -> &'static [&'static str] {
+        match self.mode {
+            DuplicateDialogMode::File => &["Overwrite", "Rename", "Skip", "Cancel"],
+            DuplicateDialogMode::Dir  => &["Write In",  "Rename", "Skip", "Cancel"],
+        }
+    }
+}
+
+// App
+
 pub struct App {
-    fs: FileSys,
-    table_state: TableState, // cursor index
+    fs: FileSystemCore,
+
+    table_state: TableState,
+    selected_index: Option<usize>,
+
     input_context: InputContext,
     input_buffer: String,
+
     show_hidden: bool,
     search_query: String,
+
     should_quit: bool,
 }
 
 impl App {
     pub fn new(start_dir: PathBuf) -> Result<App> {
-        let app = App{
-            fs: FileSys::init(start_dir)?,
+        Ok(App {
+            fs: FileSystemCore::init(start_dir),
             table_state: TableState::default(),
+            selected_index: None,
             input_context: InputContext::None,
             input_buffer: String::new(),
             show_hidden: false,
             search_query: String::new(),
             should_quit: false,
-        };
-        Ok(app)
+        })
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        self.reset_cursor();
+
         loop {
             terminal.draw(|frame| self.ui(frame))?;
 
             if self.should_quit {
-                return Ok(())
+                return Ok(());
             }
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.kind == KeyEventKind::Press {
-                    let _ = self.handle_key(key.code);
+
+            if let Ok(Event::Key(key)) = event::read() && key.kind == KeyEventKind::Press {
+                if key.code == KeyCode::Char('v')
+                    && self.input_context == InputContext::None
+                {
+                    self.paste(terminal);
+                } else {
+                    self.handle_key(key.code);
                 }
             }
         }
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> Result<()> {
+    // Key dispatch
+
+    fn handle_key(&mut self, key: KeyCode) {
         if self.input_context != InputContext::None {
-            self.handle_input_mode(key)
+            self.handle_input_mode(key);
         } else {
-            self.handle_normal_mode(key)
+            self.handle_normal_mode(key);
         }
     }
 
-    ///
-    /// # Key Handler in Input Mod
-    ///
+    // Input mode
 
-    fn handle_input_mode(&mut self, key: KeyCode) -> Result<()> {
+    fn handle_input_mode(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Char(c) => self.input_buffer.push(c),
-            KeyCode::Backspace => {self.input_buffer.pop();},
-            KeyCode::Enter => self.submit_input()?,
-            KeyCode::Esc => self.exit_input_mode(),
+            KeyCode::Char(c)   => { self.input_buffer.push(c); }
+            KeyCode::Backspace => { self.input_buffer.pop(); }
+            KeyCode::Enter     => self.submit_input(),
+            KeyCode::Esc       => self.exit_input_mode(),
             _ => {}
         }
-
-        Ok(())
     }
 
-    fn submit_input(&mut self) -> Result<()> {
+    fn submit_input(&mut self) {
         let input = self.input_buffer.trim().to_string();
 
-        if self.input_context == InputContext::Search {
-            self.search_query = input;
-            self.reset_cursor();
-            self.clear_selection();
-            self.exit_input_mode();
-            return Ok(());
-        }
-        if self.input_context == InputContext::ConfirmDelete {
-            if input == 'y'.to_string() || input == 'Y'.to_string() {
-                self.fs.delete_selected()?;
-                self.exit_input_mode();
-            } else if input == 'n'.to_string() || input == 'N'.to_string() {
+        match self.input_context {
+            InputContext::Search => {
+                self.search_query = input;
+                self.reset_cursor();
+                self.selected_index = None;
                 self.exit_input_mode();
             }
-
-            return Ok(());
-        }
-
-        if !input.is_empty() {
-            let result = match self.input_context {
-                InputContext::NewFile => self.fs.new_file(&input, false),
-                InputContext::NewDir => self.fs.new_file(&input, true),
-                InputContext::Rename => self.fs.rename_selected(&input),
-                _ => Ok(())
-            };
-
-            if let Err(error) = result {
-                self.fs.status_info = format!("Error: {}", error);
-                self.fs.status_flag = StatusFlag::Error;
+            InputContext::ConfirmDelete => {
+                if input.eq_ignore_ascii_case("y") {
+                    if let Some(idx) = self.selected_index {
+                        let _ = self.fs.select(idx);
+                    }
+                    self.fs.remove_selected();
+                    self.selected_index = None;
+                    self.reset_cursor();
+                }
+                self.exit_input_mode();
             }
+            InputContext::NewFile => {
+                if !input.is_empty() {
+                    self.fs.new_file(&input, false);
+                    self.reset_cursor();
+                }
+                self.exit_input_mode();
+            }
+            InputContext::NewDir => {
+                if !input.is_empty() {
+                    self.fs.new_file(&input, true);
+                    self.reset_cursor();
+                }
+                self.exit_input_mode();
+            }
+            InputContext::Rename => {
+                if !input.is_empty() {
+                    if let Some(idx) = self.selected_index {
+                        let _ = self.fs.select(idx);
+                    }
+                    self.fs.rename_selected(&input);
+                    self.selected_index = None;
+                    self.reset_cursor();
+                }
+                self.exit_input_mode();
+            }
+            InputContext::None => {}
         }
-
-        self.exit_input_mode();
-        Ok(())
     }
 
-    // clear input buffer and flags
     fn exit_input_mode(&mut self) {
         self.input_context = InputContext::None;
         self.input_buffer.clear();
-        self.fs.status_info = "Ready".to_string();
-        self.fs.status_flag = StatusFlag::Ready;
     }
 
-    ///
-    /// # Key Handler in Normal Mode
-    ///
-    fn handle_normal_mode(&mut self, key: KeyCode) -> Result<()> {
-        match key {
-            // guide
-            KeyCode::Char('j') => self.move_cursor(-1),
-            KeyCode::Char('k') => self.move_cursor(1),
-            KeyCode::Char('h') => self.go_parent_dir(),
-            KeyCode::Char('l') => self.enter_current(),
+    // Normal mode
 
-            // selection
+    fn handle_normal_mode(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('j')                  => self.move_cursor(1),
+            KeyCode::Char('k')                  => self.move_cursor(-1),
+            KeyCode::Char('h')                  => self.go_parent_dir(),
+            KeyCode::Char('l') | KeyCode::Enter => self.enter_current(),
+
+            #[cfg(debug_assertions)]
+            KeyCode::Down  => self.move_cursor(1),
+            #[cfg(debug_assertions)]
+            KeyCode::Up    => self.move_cursor(-1),
+            #[cfg(debug_assertions)]
+            KeyCode::Left  => self.go_parent_dir(),
+            #[cfg(debug_assertions)]
+            KeyCode::Right => self.enter_current(),
+
             KeyCode::Char(' ') => self.toggle_selection(),
 
-            // file operations
-            KeyCode::Char('c') => self.fs.copy_selected(true),
-            KeyCode::Char('x') => self.fs.copy_selected(false),
-            KeyCode::Char('v') => self.fs.paste(),
+            KeyCode::Char('c') => self.copy_marked(true),  // copy 
+            KeyCode::Char('x') => self.copy_marked(false), // cut
+            // 'v' is intercepted in run() to pass terminal
             KeyCode::Char('d') => self.start_delete_confirm(),
             KeyCode::Char('u') => self.fs.undo(),
             KeyCode::Char('r') => self.start_rename(),
 
-            // create
-            KeyCode::Char('n') => self.start_new_file(),
-            KeyCode::Char('m') => self.start_new_dir(),
+            KeyCode::Char('n') => { self.input_context = InputContext::NewFile; self.input_buffer.clear(); }
+            KeyCode::Char('m') => { self.input_context = InputContext::NewDir;  self.input_buffer.clear(); }
 
-            // filter or search
-            KeyCode::Char('.') => self.toggle_hidden_files(),
-            KeyCode::Char('/') => self.start_search(),
-            KeyCode::Esc => self.clear_search(),
+            KeyCode::Char('.') => self.toggle_hidden(),
+            KeyCode::Char('/') => { self.input_context = InputContext::Search; self.input_buffer.clear(); }
+            KeyCode::Esc       => self.clear_search(),
 
-            // exit
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                Ok(())
-            }
+            KeyCode::Char('q') => { self.should_quit = true; }
 
-            _ => Ok(())
+            _ => {}
         }
     }
 
-    ///
-    /// # Guide
-    ///
-    fn move_cursor(&mut self, delta: i32) -> Result<()> {
+    // Navigation
+
+    fn move_cursor(&mut self, delta: i32) {
         let len = self.filtered_files().len();
         if len == 0 {
             self.table_state.select(None);
-            return Ok(())
+            return;
         }
-
         let new_index = match self.table_state.selected() {
             Some(i) => {
                 if delta > 0 {
-                    if i >= len - 1 { 0 } else { i + 1 }
-                } else {
-                    if i == 0 { len - 1 } else { i - 1 }
-                }
-            },
+                    if i + 1 >= len { 0 } else { i + 1 }
+                } else if i == 0 { len - 1 } else { i - 1 }
+            }
             None => 0,
         };
-
         self.table_state.select(Some(new_index));
-        Ok(())
     }
 
-    fn go_parent_dir(&mut self) -> Result<()> {
-        self.fs.parent_dir()?;
-        self.clear_selection(); // clear selection
-        self.reset_cursor();    // clear cursor
-        Ok(())
+    fn go_parent_dir(&mut self) {
+        self.fs.parent_dir();
+        self.selected_index = None;
+        self.reset_cursor();
     }
 
-    fn enter_current(&mut self) -> Result<()> {
-        if let Some((original_index, is_dir)) = self.get_cursor_file_info() {
-            if is_dir {
-                self.fs.select_current(original_index);
-                self.fs.sub_dir(original_index)?;
-
+    fn enter_current(&mut self) {
+        if let Some((orig_idx, is_dir)) = self.cursor_file_info()
+            && is_dir {
+                let _ = self.fs.select(orig_idx);
+                self.fs.enter_selected();
                 self.search_query.clear();
-                self.clear_selection();
+                self.selected_index = None;
                 self.reset_cursor();
             }
-        }
-
-        Ok(())
     }
 
-    ///
-    /// # Select Operation
-    ///
-    fn toggle_selection(&mut self) -> Result<()> {
-        if let Some((original_index, _)) = self.get_cursor_file_info() {
-            if self.fs.selected_index() == Some(original_index) {
-                self.fs.selected_index = None;
+    // Selection / marking
+
+    fn toggle_selection(&mut self) {
+        if let Some((orig_idx, _)) = self.cursor_file_info() {
+            if self.selected_index == Some(orig_idx) {
+                self.selected_index = None;
             } else {
-                self.fs.selected_index = Some(original_index);
+                self.selected_index = Some(orig_idx);
             }
         }
-        Ok(())
-    }
-    fn clear_selection(&mut self){
-        self.fs.selected_index = None;
-    }
-    fn reset_cursor(&mut self) {
-        // if nothing in current dir(after search), current index should be None
-        let filtered = self.filtered_files();
-        self.table_state.select(if filtered.is_empty() {None} else {Some(0)});
     }
 
-    ///
-    /// # File Operation
-    ///
-    fn start_delete_confirm(&mut self) -> Result<()> {
-        if self.fs.selected_index.is_some(){
-            self.input_context = InputContext::ConfirmDelete;
-        } else {
-            self.exit_input_mode()
+    // File operations
+
+    fn copy_marked(&mut self, is_copy: bool) {
+        if let Some(idx) = self.selected_index {
+            let _ = self.fs.select(idx);
+            self.fs.copy_selected(is_copy);
         }
-        Ok(())
     }
 
-    fn start_rename(&mut self) -> Result<()> {
-        if let Some((original_index, _)) = self.get_cursor_file_info() {
-            if let Some(file) = self.fs.files().clone().get(original_index) {
-                self.fs.selected_index = Some(original_index);
-                self.input_buffer = file.name.clone();
-                self.input_context = InputContext::Rename;
+
+    fn paste(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        let term_ptr = terminal as *mut Terminal<CrosstermBackend<Stdout>>;
+        let self_ptr = self as *mut App;
+
+        self.fs.paste(move |path, is_dir| {
+            let terminal = unsafe { &mut *term_ptr };
+            let app      = unsafe { &mut *self_ptr };
+
+            let mut dialog = DuplicateDialog::new(path.clone(), is_dir);
+
+            loop {
+                terminal.draw(|frame| {
+                    app.ui(frame);
+                    Self::render_dialog(frame, &dialog);
+                }).unwrap();
+
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.kind != KeyEventKind::Press { continue; }
+
+                    // Rename sub-mode
+                    if dialog.rename_input.is_some() {
+                        match key.code {
+                            KeyCode::Char(c)   => { dialog.rename_input.as_mut().unwrap().push(c); }
+                            KeyCode::Backspace => { dialog.rename_input.as_mut().unwrap().pop(); }
+                            KeyCode::Enter => {
+                                return (Self::handler_from_dialog(&dialog), dialog.apply_to_all);
+                            }
+                            KeyCode::Esc => { dialog.rename_input = None; }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Normal dialog navigation
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if dialog.cursor + 1 < dialog.options().len() {
+                                dialog.cursor += 1;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if dialog.cursor > 0 { dialog.cursor -= 1; }
+                        }
+                        KeyCode::Char('a') | KeyCode::Char(' ') => {
+                            dialog.apply_to_all = !dialog.apply_to_all;
+                        }
+                        KeyCode::Enter => {
+                            if dialog.cursor == 1 {
+                                // Rename: collect name first
+                                let default = path.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                dialog.rename_input = Some(default);
+                            } else {
+                                return (Self::handler_from_dialog(&dialog), dialog.apply_to_all);
+                            }
+                        }
+                        KeyCode::Esc => {
+                            // Cancel entire paste
+                            return (DuplicatedFileHandleOps::Cancel, true);
+                        }
+                        _ => {}
+                    }
+                }
             }
-        }
-        Ok(())
-    }
+        });
 
-    fn start_new_file(&mut self) -> Result<()> {
-        self.input_context = InputContext::NewFile;
-        self.input_buffer.clear();
-        Ok(())
-    }
-
-    fn start_new_dir(&mut self) -> Result<()> {
-        self.input_context = InputContext::NewDir;
-        self.input_buffer.clear();
-        Ok(())
-    }
-
-    ///
-    /// # Search
-    ///
-    fn toggle_hidden_files(&mut self) -> Result<()> {
-        self.show_hidden = !self.show_hidden; // toggle status
-        self.search_query.clear();      // clear search buffer
         self.reset_cursor();
-        Ok(())
     }
 
-    fn start_search(&mut self) -> Result<()> {
-        self.input_context = InputContext::Search;
-        self.input_buffer.clear(); // set input flag
-        self.reset_cursor(); // clean search buffer
-        Ok(())
+    fn handler_from_dialog(dialog: &DuplicateDialog) -> DuplicatedFileHandleOps {
+        match dialog.cursor {
+            0 => match dialog.mode {
+                DuplicateDialogMode::File => DuplicatedFileHandleOps::Overwrite,
+                DuplicateDialogMode::Dir  => DuplicatedFileHandleOps::WriteIn,
+            },
+            1 => DuplicatedFileHandleOps::Rename(
+                dialog.rename_input.clone().unwrap_or_default()
+            ),
+            2 => DuplicatedFileHandleOps::Skip,
+            _ => DuplicatedFileHandleOps::Cancel,
+        }
     }
 
-    fn clear_search(&mut self) -> Result<()> {
+    fn start_delete_confirm(&mut self) {
+        if self.selected_index.is_some() {
+            self.input_context = InputContext::ConfirmDelete;
+            self.input_buffer.clear();
+        }
+    }
+
+    fn start_rename(&mut self) {
+        let Some(orig_idx) = self.selected_index else { return };
+        
+        if let Some(file) = self.fs.get_file(orig_idx) {
+            self.input_buffer = file.name().to_string();
+            self.input_context = InputContext::Rename;
+        }
+    }
+
+    // Search / filter
+    fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.search_query.clear();
+        self.reset_cursor();
+    }
+
+    fn clear_search(&mut self) {
         if !self.search_query.is_empty() {
             self.search_query.clear();
             self.reset_cursor();
         }
-        Ok(())
     }
 
-    ///
-    /// # UI
-    ///
-    fn ui(&mut self, frame: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(2)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
-            .split(frame.area());
+    // Helpers
 
-        self.render_table(frame, chunks[0]);
-        self.render_status_bar(frame, chunks[1]);
-    }
-
-    fn render_table(&mut self, frame: &mut Frame, area: Rect) {
-        // only show filtered files
-        let table = self.filtered_files();
-
-        let rows: Vec<Row> = table.iter().map(|(index, file)| {
-            let style = if Some(*index) == self.fs.selected_index(){
-                Style::default().add_modifier(Modifier:: BOLD).fg(Color::Cyan) // selected
-            } else {
-                Style::default() // not selected
-            };
-
-            Row::new(vec![
-                Cell::from(file.name.clone()),
-                Cell::from(if file.is_dir{"-".to_string()} else { format_file_size(file.size) }),
-                Cell::from(get_file_type(&file.path)),
-            ]).style(style)
-        }).collect();// [file_name, file_size, file_type] + style(for selected)
-
-        let mut title = self.fs.current_dir().display().to_string();
-        if !self.search_query.is_empty() { // when searching, title should change
-            title = format!("{} [Searching: '{}']", title, self.search_query);
-        }
-
-        let table = Table::new(rows, [Constraint::Min(30), Constraint::Length(12), Constraint::Min(6)])
-            .header(Row::new(vec!["Name", "Size", "Type"]).style(Style::default().add_modifier(Modifier::BOLD)))
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .column_spacing(1);
-
-        frame.render_stateful_widget(table, area, &mut self.table_state);
-    }
-
-    fn render_status_bar(&mut self, frame: &mut Frame, area: Rect) {
-        let (title, content, color) = match self.input_context {
-            InputContext::Search =>
-                ("Search", Cow::Borrowed(self.input_buffer.as_str()), Color::Gray),
-            InputContext::ConfirmDelete =>
-                ("Confirm", Cow::Owned(format!("Removed files cannot recover (y/N): {}", self.input_buffer)), Color::Magenta),
-            InputContext::None => {
-                let mut text = self.fs.status_info.clone();
-                if !self.search_query.is_empty() {
-                    text = format!("{} | Search: '{}'", text, self.search_query);
-                }
-                if self.show_hidden {
-                    text = format!("{} | [Hidden Shown]", text);
-                }
-
-                let color = match self.fs.status_flag {
-                    StatusFlag::Error => Color::Red,
-                    StatusFlag::Ready => Color::Green,
-                    StatusFlag::Input => Color::Yellow,
-                    _ => Color::White,
-                };
-                ("Status", Cow::Owned(text), color)
-            }
-            _ => ("Input", Cow::Borrowed(self.input_buffer.as_str()), Color::Yellow),
-        };
-
-        let widget = Paragraph::new(content.as_ref())
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .style(Style::default().fg(color));
-        frame.render_widget(widget, area);
-    }
-
-    ///
-    /// # Helpers
-    ///
-
-    fn filtered_files(&self) -> Vec<(usize, &FileInfo)> { // (original_index, file_info)
-        // filter files, include hide and search
-        self.fs.files()
+    fn filtered_files(&self) -> Vec<(usize, &FileInfo)> {
+        self.fs
+            .files()
             .iter()
-            .enumerate() // original index
-            .filter(|(_, file)| {
-                // hide
-                let show_file = self.show_hidden || !file.name.starts_with('.');
-                // search
-                let matches_search = self.search_query.is_empty()
-                    || file.name.to_lowercase().contains(&self.search_query.to_lowercase());
-                show_file && matches_search
+            .enumerate()
+            .filter(|(_, f)| {
+                let visible = self.show_hidden || !f.name().starts_with('.');
+                let matched = self.search_query.is_empty()
+                    || f.name().to_lowercase().contains(&self.search_query.to_lowercase());
+                visible && matched
             })
             .collect()
     }
 
-    fn get_cursor_file_info(&self) -> Option<(usize, bool)> { // (original_index, is_dir)
-        let filtered = self.filtered_files(); // (original_index, file_info)
-        self.table_state.selected()
-            .and_then(|index| {filtered.get(index)})
-            .map(|(original_index, file)| (*original_index, file.is_dir))
+    fn cursor_file_info(&self) -> Option<(usize, bool)> {
+        let filtered = self.filtered_files();
+        self.table_state
+            .selected()
+            .and_then(|i| filtered.get(i))
+            .map(|(orig, f)| (*orig, f.is_dir()))
+    }
+
+    fn reset_cursor(&mut self) {
+        let filtered = self.filtered_files();
+        self.table_state
+            .select(if filtered.is_empty() { None } else { Some(0) });
+    }
+
+    // UI
+
+    fn ui(&mut self, frame: &mut Frame) {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(frame.area());
+
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(outer[0]);
+
+        self.render_file_list(frame, panes[0]);
+        self.render_preview(frame, panes[1]);
+        self.render_status_bar(frame, outer[1]);
+    }
+
+    // Duplicate dialog
+
+    fn render_dialog(frame: &mut Frame, dialog: &DuplicateDialog) {
+        let area = frame.area();
+        let w = 52u16.min(area.width.saturating_sub(4));
+        let rename_rows: u16 = if dialog.rename_input.is_some() { 2 } else { 0 };
+        let h = (7 + dialog.options().len() as u16 + rename_rows)
+            .min(area.height.saturating_sub(2));
+        let x = (area.width.saturating_sub(w)) / 2;
+        let y = (area.height.saturating_sub(h)) / 2;
+        let popup_area = Rect::new(x, y, w, h);
+
+        frame.render_widget(Clear, popup_area);
+
+        let filename = dialog.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dialog.path.display().to_string());
+
+        let title = if dialog.mode == DuplicateDialogMode::File {
+            "Duplicate File"
+        } else {
+            "Duplicate Directory"
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(&filename, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(" already exists"),
+        ]));
+        lines.push(Line::raw(""));
+
+        if dialog.rename_input.is_none() {
+            let toggle = if dialog.apply_to_all { "[*]" } else { "[ ]" };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(toggle, Style::default().fg(Color::Cyan)),
+                Span::raw("  Apply to all  "),
+                Span::styled("(a / space)", Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::raw(""));
+
+            for (i, label) in dialog.options().iter().enumerate() {
+                let selected = i == dialog.cursor;
+                let marker = if selected { "> " } else { "  " };
+                let style = if selected {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{marker}{label}"), style),
+                ]));
+            }
+        } else {
+            let name = dialog.rename_input.as_deref().unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::raw("  Rename to: "),
+                Span::styled(
+                    format!("{name}_"),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                format!(" {title} "),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))
+            .title_alignment(Alignment::Center)
+            .border_style(Style::default().fg(Color::Red));
+
+        frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+    }
+
+    // Left pane: file list
+
+    fn render_file_list(&mut self, frame: &mut Frame, area: Rect) {
+        let filtered = self.filtered_files();
+
+        let rows: Vec<Row> = filtered
+            .iter()
+            .map(|(orig_idx, file)| {
+                let is_marked = self.selected_index == Some(*orig_idx);
+                let name_style = if file.is_dir() {
+                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let mark_cell = if is_marked {
+                    Cell::from(">").style(Style::default().fg(Color::Cyan))
+                } else {
+                    Cell::from(" ")
+                };
+                Row::new(vec![
+                    mark_cell,
+                    Cell::from(file.name().to_string()).style(name_style),
+                    Cell::from(if file.is_dir() {
+                        "  —".to_string()
+                    } else {
+                        format_size(file.size())
+                    }),
+                    Cell::from(file_type(file.path())),
+                ])
+            })
+            .collect();
+
+        let mut title = self.fs.current_dir().display().to_string();
+        if !self.search_query.is_empty() {
+            title = format!("{} [/{}]", title, self.search_query);
+        }
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(7),
+            ],
+        )
+        .header(
+            Row::new(vec![" ", "Name", "Size", "Type"])
+                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+        )
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .column_spacing(1);
+
+        frame.render_stateful_widget(table, area, &mut self.table_state);
+    }
+
+    // Right pane: preview
+
+    fn render_preview(&self, frame: &mut Frame, area: Rect) {
+        let Some((orig_idx, is_dir)) = self.cursor_file_info() else {
+            frame.render_widget(
+                Paragraph::new("(empty)")
+                    .block(Block::default().borders(Borders::ALL).title("Preview")),
+                area,
+            );
+            return;
+        };
+
+        let Some(file) = self.fs.get_file(orig_idx) else {
+            frame.render_widget(
+                Paragraph::new("(no file)")
+                    .block(Block::default().borders(Borders::ALL).title("Preview")),
+                area,
+            );
+            return;
+        };
+
+        let title = file.name().to_string();
+
+        if is_dir {
+            self.render_dir_preview(frame, area, file.path(), &title);
+        } else {
+            let desc = self.fs.get_description(orig_idx);
+            let text = desc.to_string_lossy().into_owned();
+            let content = format!("Size: {}\n{}", format_size(file.size()), text);
+            frame.render_widget(
+                Paragraph::new(content)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(title)
+                            .border_style(Style::default().fg(Color::DarkGray)),
+                    )
+                    .style(Style::default().fg(Color::Gray)),
+                area,
+            );
+        }
+    }
+
+    fn render_dir_preview(&self, frame: &mut Frame, area: Rect, dir: &PathBuf, title: &str) {
+        use std::fs;
+
+        let entries: Vec<ListItem> = match fs::read_dir(dir) {
+            Err(_) => {
+                frame.render_widget(
+                    Paragraph::new("(permission denied)")
+                        .block(Block::default().borders(Borders::ALL).title(title)),
+                    area,
+                );
+                return;
+            }
+            Ok(rd) => {
+                let mut items: Vec<(String, bool)> = rd
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        if !self.show_hidden && name.starts_with('.') { return None; }
+                        Some((name, is_dir))
+                    })
+                    .collect();
+
+                items.sort_by(|(na, da), (nb, db)| match (da, db) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => na.cmp(nb),
+                });
+
+                items.into_iter().map(|(name, is_dir)| {
+                    let style = if is_dir {
+                        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(if is_dir { "> " } else { "  " }, style),
+                        Span::styled(name, style),
+                    ]))
+                }).collect()
+            }
+        };
+
+        frame.render_widget(
+            List::new(entries).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(Color::Blue)),
+            ),
+            area,
+        );
+    }
+
+    // Status bar 
+
+    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        let (title, content, color) = match self.input_context {
+            InputContext::Search => (
+                "Search",
+                format!("{}_", self.input_buffer),
+                Color::Cyan,
+            ),
+            InputContext::ConfirmDelete => (
+                "Delete",
+                format!("Delete marked file? (y/N): {}", self.input_buffer),
+                Color::Red,
+            ),
+            InputContext::NewFile => (
+                "New File",
+                format!("Name: {}_", self.input_buffer),
+                Color::Yellow,
+            ),
+            InputContext::NewDir => (
+                "New Dir",
+                format!("Name: {}_", self.input_buffer),
+                Color::Yellow,
+            ),
+            InputContext::Rename => (
+                "Rename",
+                format!("New name: {}_", self.input_buffer),
+                Color::Yellow,
+            ),
+            InputContext::None => {
+                let flag = self.fs.state_flag();
+                let info = self.fs.state_info().to_string();
+                let mut parts = vec![info];
+                if !self.search_query.is_empty() {
+                    parts.push(format!("search: '{}'", self.search_query));
+                }
+                if self.show_hidden {
+                    parts.push("hidden shown".to_string());
+                }
+                if let Some(idx) = self.selected_index && let Some(f) = self.fs.get_file(idx) {
+                    parts.push(format!("marked: {}", f.name()));
+                }
+                let color = match flag {
+                    StateFlag::Error     => Color::Red,
+                    StateFlag::Ready     => Color::Green,
+                    StateFlag::Operating => Color::Yellow,
+                };
+                ("Status", parts.join("  │  "), color)
+            }
+        };
+
+        frame.render_widget(
+            Paragraph::new(content)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .style(Style::default().fg(color)),
+            area,
+        );
     }
 }
 
-fn format_file_size(size: u64) -> String {
-    if size == 0 { return "0 B".to_string(); }
+// Utility functions
 
+fn format_size(size: u64) -> String {
+    if size == 0 { return "0 B".to_string(); }
     let units = ["B", "KB", "MB", "GB"];
     let mut value = size as f64;
-    let mut unit_idx = 0;
-
-    while value >= 1024.0 && unit_idx < units.len() - 1 {
+    let mut idx = 0;
+    while value >= 1024.0 && idx < units.len() - 1 {
         value /= 1024.0;
-        unit_idx += 1;
+        idx += 1;
     }
-
-    format!("{:.1} {}", value, units[unit_idx])
+    format!("{:.1} {}", value, units[idx])
 }
 
-fn get_file_type(path: &PathBuf) -> &'static str {
-    if let Ok(metadata) = metadata(path) {
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() { "DIR" }
-        else if file_type.is_file() { "FILE" }
-        else if file_type.is_symlink() { "SYMLINK" }
-        else if file_type.is_fifo() { "FIFO" }
-        else if file_type.is_char_device() { "CHAR" }
-        else if file_type.is_block_device() { "BLOCK" }
-        else if file_type.is_socket() { "SOCKET" }
-        else { "UNKNOWN" }
-    } else {
-        "ERROR"
+fn file_type(path: &PathBuf) -> &'static str {
+    match metadata(path) {
+        Err(_) => "ERR",
+        Ok(m) => {
+            let ft = m.file_type();
+            if ft.is_dir()               { "DIR"  }
+            else if ft.is_symlink()      { "LINK" }
+            else if ft.is_fifo()         { "FIFO" }
+            else if ft.is_char_device()  { "CHAR" }
+            else if ft.is_block_device() { "BLK"  }
+            else if ft.is_socket()       { "SOCK" }
+            else                         { "FILE" }
+        }
     }
 }
