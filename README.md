@@ -5,9 +5,10 @@ Built in Rust with Ratatui and Crossterm, it's a no-frills tool for browsing fil
 
 ## Features
   - Supports most of the file operation, like Copy, Cut, Paste
-  - unable to recursive copy a dir, which meand you still need to copy file by file
-  - couldn'd undo `delete`, because Trash dir may not exist
-  - need not mouse
+  - could handle conflict file while pasting files
+  - couldn't operate `delete`, because Trash dir may not exist
+  - need not mouse, and arrow-key
+  - probably crash if there are too many fils in current directory
   - can work on my machine(seriously I.MX6ULL MINI)
 
 ## Compile
@@ -17,19 +18,21 @@ and the given config is used for Arm-Linux. Just run the following command
 
 ```
 cargo build --target armv7-unknown-linux-musleabihf --release
-
 ```
+
 ## Keybindings
-| Key       | Action                  | Notes                          |
-|-----------|-------------------------|--------------------------------|
-| `j` / `k` | Down / Up               | Cycle rows                     |
-| `h`       | Parent directory        | `cd ..` equivalent             |
-| `l` / `Enter` | Enter dir / Select file | Resets selection to 0 on enter |
-| `Space`   | Select current          | Updates status                 |
-| `c` / `x` | Copy / Cut file         | Files only; to clipboard       |
-| `v`       | Paste                   | From clipboard to current/target dir |
-| `d`       | Delete                  | Magenta confirm: y/N (irreversible) |
-| `n` / `m` | New file / New dir      | Enter name in input mode       |
-| `r`       | Rename selected         | Pre-fills name in input mode   |
-| `u`       | Undo last operation     | Most ops; history capped at 64 |
-| `q` / `Esc` | Quit / Cancel input  | Escape hatches everywhere      |
+| Key       | Action                  | Notes                                |
+|-----------|-------------------------|--------------------------------------|
+| /         | Search                  | Search Files                         |
+| .         | Hide                    | Toggle visibility for hidden files   | 
+| j   k     | Down / Up               | Cycle rows                           |
+| h         | Parent directory        | `cd ..` equivalent                   |
+| l   Enter | Enter dir / Select file | Resets selection to 0 on enter       |
+| Space     | Select current          | Toggle Selection                     |
+| c   x     | Copy / Cut file         | To clipboard                         |
+| v         | Paste                   | From clipboard to current/target dir |
+| d         | Delete                  | Unimplemented                        |
+| n   m     | New file / New dir      | Enter name in input mode             |
+| r         | Rename selected         | Pre-fills name in input mode         |
+| u         | Undo last operation     | Most ops                             |
+| q   Esc   | Quit / Cancel input     | Escape hatches everywhere            |

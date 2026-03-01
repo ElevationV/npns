@@ -5,3 +5,10 @@ rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=cortex-a7"]
 [env]
 CC_armv7_unknown_linux_musleabihf = "armv7l-linux-gnueabihf-gcc"
 AR_armv7_unknown_linux_musleabihf = "armv7l-linux-gnueabihf-ar"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["panic_immediate_abort"]
+
+[build]
+rustflags = ["-C", "panic=abort"]
