@@ -88,7 +88,7 @@ pub enum DirConflictResult {
 // handle_file_duplicate, handle_dir_duplicate
 //
 // They are the ONLY places the callback-function is called 
-// apart from paste_dir's single top-level call, which also goes through handle_dir_duplicate
+// apart from paste_dir single top-level call, which also goes through handle_dir_duplicate
 //
 // Both functions loop until the chosen is conflict-free, 
 // handling the case where a user-supplied Rename target also collides
@@ -124,7 +124,6 @@ where
                 };
                 let renamed = parent.join(new_name);
                 // Rename never participates in apply-to-all (enforced inApplyToAll::update), 
-                // but we still honour the returned `apply` value so the caller can record it accurately
                 current = renamed;
                 // Loop — check whether the renamed target also conflicts
             }

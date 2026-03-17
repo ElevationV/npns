@@ -21,7 +21,6 @@ use crate::fs_info::{
     FileSystemCore,
     DuplicatedFileHandleOps,
     StateFlag,
-    FileInfo,
 };
 
 // Input context
@@ -393,9 +392,11 @@ impl App {
 
     fn start_rename(&mut self) {
         let Some(orig_idx) = self.selected_index else { return };
-        
-        if let Some(file) = self.fs.get_file(orig_idx) {
-            self.input_buffer = file.name().to_string();
+
+        if let Some(path) = self.fs.get_file(orig_idx) {
+            self.input_buffer = path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             self.input_context = InputContext::Rename;
         }
     }
@@ -416,15 +417,18 @@ impl App {
 
     // Helpers
 
-    fn filtered_files(&self) -> Vec<(usize, &FileInfo)> {
+    fn filtered_files(&self) -> Vec<(usize, &PathBuf)> {
         self.fs
             .files()
             .iter()
             .enumerate()
             .filter(|(_, f)| {
-                let visible = self.show_hidden || !f.name().starts_with('.');
+                let name = f.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let visible = self.show_hidden || !name.starts_with('.');
                 let matched = self.search_query.is_empty()
-                    || f.name().to_lowercase().contains(&self.search_query.to_lowercase());
+                    || name.to_lowercase().contains(&self.search_query.to_lowercase());
                 visible && matched
             })
             .collect()
@@ -435,7 +439,7 @@ impl App {
         self.table_state
             .selected()
             .and_then(|i| filtered.get(i))
-            .map(|(orig, f)| (*orig, f.is_dir()))
+            .map(|(orig, path)| (*orig, path.is_dir()))
     }
 
     fn reset_cursor(&mut self) {
@@ -550,9 +554,12 @@ impl App {
 
         let rows: Vec<Row> = filtered
             .iter()
-            .map(|(orig_idx, file)| {
+            .map(|(orig_idx, path)| {
                 let is_marked = self.selected_index == Some(*orig_idx);
-                let name_style = if file.is_dir() {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let name_style = if path.is_dir() {
                     Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -564,13 +571,15 @@ impl App {
                 };
                 Row::new(vec![
                     mark_cell,
-                    Cell::from(file.name().to_string()).style(name_style),
-                    Cell::from(if file.is_dir() {
+                    Cell::from(name).style(name_style),
+                    Cell::from(if path.is_dir() {
                         "  —".to_string()
                     } else {
-                        format_size(file.size())
+                        path.metadata()
+                            .map(|m| format_size(m.len()))
+                            .unwrap_or_else(|_| "?".to_string())
                     }),
-                    Cell::from(file_type(file.path())),
+                    Cell::from(file_type(path)),
                 ])
             })
             .collect();
@@ -621,14 +630,19 @@ impl App {
             return;
         };
 
-        let title = file.name().to_string();
+        let title = file.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         if is_dir {
-            self.render_dir_preview(frame, area, file.path(), &title);
+            self.render_dir_preview(frame, area, file, &title);
         } else {
             let desc = self.fs.get_description(orig_idx);
             let text = desc.to_string_lossy().into_owned();
-            let content = format!("Size: {}\n{}", format_size(file.size()), text);
+            let size_str = file.metadata()
+                .map(|m| format_size(m.len()))
+                .unwrap_or_else(|_| "?".to_string());
+            let content = format!("Size: {}\n{}", size_str, text);
             frame.render_widget(
                 Paragraph::new(content)
                     .block(
@@ -736,8 +750,13 @@ impl App {
                 if self.show_hidden {
                     parts.push("hidden shown".to_string());
                 }
-                if let Some(idx) = self.selected_index && let Some(f) = self.fs.get_file(idx) {
-                    parts.push(format!("marked: {}", f.name()));
+                if let Some(idx) = self.selected_index
+                    && let Some(f) = self.fs.get_file(idx)
+                {
+                    let name = f.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    parts.push(format!("marked: {}", name));
                 }
                 let color = match flag {
                     StateFlag::Error     => Color::Red,

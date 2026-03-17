@@ -14,7 +14,6 @@ use crate::{
 use crate::fs_info::{
     clipboard::Clipboard,
     duplicate_handler::{DuplicatedFileHandleOps, PasteAbort, ApplyToAll, FileConflictResult, DirConflictResult},
-    file_info::FileInfo,
     file_list::FileList,
     history::History,
     operations::{OperationFS, OperationUnitFS},
@@ -76,12 +75,12 @@ impl FileSystemCore {
     pub fn copy_selected(&mut self, is_copy: bool) {
         let result = self.get_selected_file_info();
         let file = check_or_return!(self, "Copy/Cut File", result);
-        let path = file.path().clone();
-        let name = file.name().to_string();
-        self.clipboard.set(path, is_copy);
+        let name = check_or_return!(self, "Copy", get_file_name(file));
+        
+        self.clipboard.set(file.clone(), is_copy);
         self.set_state(
             Ready,
-            format!("{}: {}", if is_copy { "Copied" } else { "Cut" }, name),
+            format!("{}: {:?}", if is_copy { "Copied" } else { "Cut" }, name),
         );
     }
 
@@ -112,13 +111,13 @@ impl FileSystemCore {
                 if file.is_dir() {
                     check_or_return_with!(
                         self,
-                        self.get_dir_preview::<&PathBuf, 10>(file.path()),
+                        self.get_dir_preview::<&PathBuf, 10>(file),
                         OsString::from_str("Fail to get preview").unwrap()
                     )
                 } else {
                     check_or_return_with!(
                         self,
-                        self.get_file_description(file.path()),
+                        self.get_file_description(file),
                         OsString::from_str("Fail to get preview").unwrap()
                     )
                 }
@@ -129,7 +128,7 @@ impl FileSystemCore {
 
     pub fn rename_selected(&mut self, new_name: &str) {
         let file = check_or_return!(self, "Rename", self.get_selected_file_info());
-        let old_path = file.path().clone();
+        let old_path = file.clone();
         let new_path = check_or_return!(self, "Rename", rename_file_name(&old_path, new_name));
         check_or_return!(self, "Rename", fs::rename(&old_path, &new_path));
         self.push_history(OperationFS::Rename, old_path, new_path);
@@ -165,8 +164,8 @@ impl FileSystemCore {
     }
 
     pub fn enter_selected(&mut self) {
-        let (file_path, file_name, is_dir) = match self.get_selected_file_info() {
-            Ok(f) => (f.path().clone(), f.name().to_string(), f.is_dir()),
+        let (file_path, is_dir) = match self.get_selected_file_info() {
+            Ok(f) => (f.clone(), f.is_dir()),
             Err(e) => { self.set_state(Error, e); return; }
         };
         if !is_dir {
@@ -174,7 +173,7 @@ impl FileSystemCore {
             return;
         }
         match self.change_dir(file_path) {
-            Ok(()) => self.set_state(Ready, format!("Entered: {}", file_name)),
+            Ok(()) => self.set_state(Ready, "Entered"),
             Err(e) => self.set_state(Error, format!("Failed to enter directory: {}", e)),
         }
     }
@@ -263,8 +262,8 @@ impl FileSystemCore {
         todo!() 
     }
 
-    pub fn files(&self) -> &[FileInfo] { self.file_list.files() }
-    pub fn get_file(&self, index: usize) -> Option<&FileInfo> { self.file_list.get(index) }
+    pub fn files(&self) -> &[PathBuf] { self.file_list.files() }
+    pub fn get_file(&self, index: usize) -> Option<&PathBuf> { self.file_list.get(index) }
     pub fn current_dir(&self) -> &PathBuf { &self.current_dir }
     pub fn state_flag(&self) -> StateFlag { self.state.flag() }
     pub fn state_info(&self) -> &str { self.state.info() }
@@ -279,7 +278,7 @@ impl FileSystemCore {
     fn set_operating_state<S: Into<String>>(&mut self, op: S) {
         self.state.set(Operating, op);
     }
-    fn get_selected_file_info(&self) -> Result<&FileInfo, String> {
+    fn get_selected_file_info(&self) -> Result<&PathBuf, String> {
         self.file_list.get_selected_file()
     }
     fn get_clipboard(&self) -> Result<&(PathBuf, bool), String> {
@@ -630,3 +629,9 @@ fn rename_file_name(original: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(parent.join(name))
 }
 
+fn get_file_name(file: &PathBuf) -> Result<String, String> {
+    match file.file_name() {
+        Some(name) => Ok(name.to_string_lossy().into_owned()),
+        None => Err(format!("Error getting file name from: {:?}", file))
+    }
+}
