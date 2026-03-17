@@ -1,12 +1,11 @@
-use crate::fs_info::file_info::FileInfo;
 use std::cmp::Ordering;
 use std::fs::{read_dir};
 use std::io;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 
 /// Catalogue of a dir
 pub struct FileList {
-    files: Vec<FileInfo>,
+    files: Vec<PathBuf>,
     selected_index: Option<usize>,
 }
 
@@ -25,15 +24,8 @@ impl FileList {
         for entry in read_dir(path)? {
             let entry = entry?;
             let file_path = entry.path();
-
-            if let Some(file_name) = file_path.file_name() {
-                let file_name = file_name.to_string_lossy().into_owned();
-
-                // skip files fail to read metadata
-                if let Ok(m) = file_path.metadata() {
-                    self.push(FileInfo::new(file_name, file_path, m.len(), m.is_dir()));
-                }
-            }
+            
+            self.push(file_path);
         }
 
         self.sort();
@@ -41,7 +33,7 @@ impl FileList {
     }
 
     pub fn sort(&mut self) {
-        self.files.sort_by(compare_by_is_dir_then_name);
+        self.files.sort_by(|a, b| compare_by_is_dir_then_name(a, b));
     }
 
     // selection
@@ -61,24 +53,20 @@ impl FileList {
         self.selected_index = None;
     }
 
-    pub fn get_selected_file(&self) -> Result<&FileInfo, String> {
+    pub fn get_selected_file(&self) -> Result<&PathBuf, String> {
         match self.selected_index {
             Some(index) => Ok(&self.files[index]),
             None => Err("No File Selected!".to_string()),
         }
     }
 
-
-    
     // add items
-    pub fn push(&mut self, file: FileInfo) {
+    pub fn push(&mut self, file: PathBuf) {
         self.files.push(file);
     }
 
-
-
     //getters
-    pub fn get(&self, index: usize) -> Option<&FileInfo> {
+    pub fn get(&self, index: usize) -> Option<&PathBuf> {
         self.files.get(index)
     }
 
@@ -86,7 +74,7 @@ impl FileList {
         self.files.len()
     }
     
-    pub fn files(&self) -> &[FileInfo] {
+    pub fn files(&self) -> &[PathBuf] {
         &self.files
     }
 }
@@ -100,10 +88,10 @@ impl FileList {
 }
 
 // ordering rules: dir comes first, then sorted by name
-fn compare_by_is_dir_then_name(a: &FileInfo, b: &FileInfo) -> Ordering {
+fn compare_by_is_dir_then_name(a: &Path, b: &Path) -> Ordering {
     match (a.is_dir(), b.is_dir()) {
         (true, false) => Ordering::Less,
         (false, true) => Ordering::Greater,
-        _ => a.name().cmp(b.name()),
+        _ => a.file_name().cmp(&b.file_name()),
     }
 }
