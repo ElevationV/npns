@@ -4,6 +4,7 @@ use std::fs::metadata;
 use std::io::Read;
 use std::path::PathBuf;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::fs_info::{FileSystemCore, DuplicatedFileHandleOps, StateFlag};
 use crate::ui::{
@@ -557,11 +558,22 @@ impl App {
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
-        // Probe the first 512 bytes to distinguish text from binary
+        let meta = file.symlink_metadata().ok();
+        let is_regular = meta.as_ref()
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
+        
         let mut buf = [0u8; 512];
-        let n = std::fs::File::open(file)
-            .and_then(|mut f| f.read(&mut buf))
-            .unwrap_or(0);
+        let n = if is_regular {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(file)
+                .and_then(|mut f| f.read(&mut buf))
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let content = if file.is_symlink() {
             let target = std::fs::read_link(file)
@@ -570,7 +582,8 @@ impl App {
             format!("Size: {}\nsymlink -> {}", size_str, target)
         } else if n == 0 || std::str::from_utf8(&buf[..n]).is_ok() {
             // Valid UTF-8 — treat as text and show the full content
-            let text = std::fs::read_to_string(file).unwrap_or_default();
+            let inner_h = area.h.saturating_sub(4) as usize;
+            let text = read_text_preview(file, inner_h);
             format!("Size: {}\n\n{}", size_str, text)
         } else {
             // Binary — show extension-based description
@@ -856,4 +869,35 @@ fn format_permissions(mode: u32) -> String {
         s.push(if mode & bit != 0 { ch } else { '-' });
     }
     s
+}
+
+fn read_text_preview(path: &PathBuf, max_lines: usize) -> String {
+    use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::OpenOptionsExt;
+    
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        else {
+            return String::new();
+        };
+    
+        let mut reader = BufReader::new(file.take(64 * 1024));
+    let mut out = String::new();
+    let mut line = String::new();
+    let mut count = 0;
+
+    while count < max_lines {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,           // EOF
+            Ok(_) => {
+                out.push_str(&line);
+                count += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    out
 }

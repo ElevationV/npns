@@ -279,25 +279,56 @@ pub fn render_paragraph(
 
     // Word-wrap / line-split the content to fill the inner area
     let lines = wrap_lines(text, inner_w);
-    for (i, line) in lines.iter().take(inner_h).enumerate() {
-        let padded = pad_to_cols(line, inner_w);
-        scr.print_styled(col + 1, row + 1 + i as u16, &padded, text_style, inner_w as u16);
+    for i in 0..inner_h {
+        let screen_row = row + 1 + i as u16;
+        let padded = lines.get(i)
+            .map(|l| pad_to_cols(l, inner_w))
+            .unwrap_or_else(|| " ".repeat(inner_w));
+        scr.print_styled(col + 1, screen_row, &padded, text_style, inner_w as u16);
     }
 }
 
 // split `text` at newlines, and wrap long lines to `max_w` columns.
 fn wrap_lines(text: &str, max_w: usize) -> Vec<String> {
+    if max_w == 0 { return Vec::new(); }
     let mut out = Vec::new();
     for raw_line in text.lines() {
         if raw_line.is_empty() {
             out.push(String::new());
             continue;
         }
-        let mut remaining = raw_line;
+        let expanded = expand_tabs(raw_line);
+        let mut remaining: &str = &expanded;
         while !remaining.is_empty() {
             let chunk = truncate_to_cols(remaining, max_w);
-            out.push(chunk.to_owned());
-            remaining = &remaining[chunk.len()..];
+            if chunk.is_empty() {
+                let skip = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                remaining = &remaining[skip..];
+            } else {
+                out.push(chunk.to_owned());
+                remaining = &remaining[chunk.len()..];
+            }
+        }
+    }
+    out
+}
+
+fn expand_tabs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let spaces = 8 - (col % 8);
+            for _ in 0..spaces { out.push(' '); }
+            col += spaces;
+        } else {
+            out.push(ch);
+            col += if matches!(ch,
+                '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{303E}' |
+                '\u{3041}'..='\u{33FF}' | '\u{4E00}'..='\u{9FFF}' |
+                '\u{AC00}'..='\u{D7AF}' | '\u{F900}'..='\u{FAFF}' |
+                '\u{FF01}'..='\u{FF60}' | '\u{FFE0}'..='\u{FFE6}'
+            ) { 2 } else { 1 };
         }
     }
     out
