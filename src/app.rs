@@ -1,30 +1,28 @@
 #![allow(dead_code)]
 
 use std::fs::metadata;
-use std::io::Stdout;
+use std::io::Read;
 use std::path::PathBuf;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+use crate::fs_info::{FileSystemCore, DuplicatedFileHandleOps, StateFlag};
+use crate::ui::{
+    read_key, KeyCode,
+    Color, Rect, Screen, Style,
+    ColWidth, DialogLine, Row,
+    render_dialog, render_list, render_paragraph,
+    render_status_bar, render_table,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Cell, Table, TableState},
-    Frame, Terminal,
-};
-
-use crate::fs_info::{
-    FileSystemCore,
-    DuplicatedFileHandleOps,
-    StateFlag,
-};
+struct CursorInfo {
+    orig_idx: Option<usize>,
+    pos:      usize, 
+    total:    usize,
+}
 
 // Input context
-
 #[derive(PartialEq, Clone, Copy)]
 enum InputContext {
     None,
@@ -35,8 +33,7 @@ enum InputContext {
     Search,
 }
 
-// Duplicate dialog
-
+// Duplicate dialog state
 #[derive(PartialEq, Clone)]
 enum DuplicateDialogMode {
     File,
@@ -45,10 +42,10 @@ enum DuplicateDialogMode {
 
 #[derive(Clone)]
 struct DuplicateDialog {
-    path: PathBuf,
-    mode: DuplicateDialogMode,
+    path:         PathBuf,
+    mode:         DuplicateDialogMode,
     apply_to_all: bool,
-    cursor: usize,
+    cursor:       usize,
     rename_input: Option<String>,
 }
 
@@ -72,60 +69,51 @@ impl DuplicateDialog {
 }
 
 // App
-
 pub struct App {
-    fs: FileSystemCore,
-
-    table_state: TableState,
-    selected_index: Option<usize>,
-
-    input_context: InputContext,
-    input_buffer: String,
-
-    show_hidden: bool,
-    search_query: String,
-
-    should_quit: bool,
+    fs:             FileSystemCore,
+    cursor:         usize,         // index into filtered_files()
+    selected_index: Option<usize>, // marked file (orig index into fs.files())
+    input_context:  InputContext,
+    input_buffer:   String,
+    show_hidden:    bool,
+    search_query:   String,
+    should_quit:    bool,
 }
 
 impl App {
     pub fn new(start_dir: PathBuf) -> Result<App> {
         Ok(App {
-            fs: FileSystemCore::init(start_dir),
-            table_state: TableState::default(),
+            fs:             FileSystemCore::init(start_dir),
+            cursor:         0,
             selected_index: None,
-            input_context: InputContext::None,
-            input_buffer: String::new(),
-            show_hidden: false,
-            search_query: String::new(),
-            should_quit: false,
+            input_context:  InputContext::None,
+            input_buffer:   String::new(),
+            show_hidden:    false,
+            search_query:   String::new(),
+            should_quit:    false,
         })
     }
 
-    pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    // Main loop
+    pub fn run(&mut self, scr: &mut Screen) -> Result<()> {
         self.reset_cursor();
 
         loop {
-            terminal.draw(|frame| self.ui(frame))?;
+            self.draw(scr);
 
-            if self.should_quit {
-                return Ok(());
-            }
+            if self.should_quit { break; }
 
-            if let Ok(Event::Key(key)) = event::read() && key.kind == KeyEventKind::Press {
-                if key.code == KeyCode::Char('v')
-                    && self.input_context == InputContext::None
-                {
-                    self.paste(terminal);
-                } else {
-                    self.handle_key(key.code);
-                }
+            let key = read_key()?;
+            if key == KeyCode::Char('v') && self.input_context == InputContext::None {
+                self.paste(scr);
+            } else {
+                self.handle_key(key);
             }
         }
+        Ok(())
     }
 
     // Key dispatch
-
     fn handle_key(&mut self, key: KeyCode) {
         if self.input_context != InputContext::None {
             self.handle_input_mode(key);
@@ -135,7 +123,6 @@ impl App {
     }
 
     // Input mode
-
     fn handle_input_mode(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char(c)   => { self.input_buffer.push(c); }
@@ -202,7 +189,6 @@ impl App {
     }
 
     // Normal mode
-
     fn handle_normal_mode(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char('j')                  => self.move_cursor(1),
@@ -221,20 +207,27 @@ impl App {
 
             KeyCode::Char(' ') => self.toggle_selection(),
 
-            KeyCode::Char('c') => self.copy_marked(true),  // copy 
-            KeyCode::Char('x') => self.copy_marked(false), // cut
-            // 'v' is intercepted in run() to pass terminal
+            KeyCode::Char('c') => self.copy_marked(true),
+            KeyCode::Char('x') => self.copy_marked(false),
             KeyCode::Char('d') => self.start_delete_confirm(),
             KeyCode::Char('u') => self.fs.undo(),
             KeyCode::Char('r') => self.start_rename(),
 
-            KeyCode::Char('n') => { self.input_context = InputContext::NewFile; self.input_buffer.clear(); }
-            KeyCode::Char('m') => { self.input_context = InputContext::NewDir;  self.input_buffer.clear(); }
+            KeyCode::Char('n') => {
+                self.input_context = InputContext::NewFile;
+                self.input_buffer.clear();
+            }
+            KeyCode::Char('m') => {
+                self.input_context = InputContext::NewDir;
+                self.input_buffer.clear();
+            }
 
             KeyCode::Char('.') => self.toggle_hidden(),
-            KeyCode::Char('/') => { self.input_context = InputContext::Search; self.input_buffer.clear(); }
-            KeyCode::Esc       => self.clear_search(),
-
+            KeyCode::Char('/') => {
+                self.input_context = InputContext::Search;
+                self.input_buffer.clear();
+            }
+            KeyCode::Esc => self.clear_search(),
             KeyCode::Char('q') => { self.should_quit = true; }
 
             _ => {}
@@ -242,22 +235,17 @@ impl App {
     }
 
     // Navigation
-
     fn move_cursor(&mut self, delta: i32) {
         let len = self.filtered_files().len();
         if len == 0 {
-            self.table_state.select(None);
+            self.cursor = 0;
             return;
         }
-        let new_index = match self.table_state.selected() {
-            Some(i) => {
-                if delta > 0 {
-                    if i + 1 >= len { 0 } else { i + 1 }
-                } else if i == 0 { len - 1 } else { i - 1 }
-            }
-            None => 0,
-        };
-        self.table_state.select(Some(new_index));
+        if delta > 0 {
+            self.cursor = if self.cursor + 1 >= len { 0 } else { self.cursor + 1 };
+        } else {
+            self.cursor = if self.cursor == 0 { len - 1 } else { self.cursor - 1 };
+        }
     }
 
     fn go_parent_dir(&mut self) {
@@ -267,18 +255,16 @@ impl App {
     }
 
     fn enter_current(&mut self) {
-        if let Some((orig_idx, is_dir)) = self.cursor_file_info()
-            && is_dir {
-                let _ = self.fs.select(orig_idx);
-                self.fs.enter_selected();
-                self.search_query.clear();
-                self.selected_index = None;
-                self.reset_cursor();
-            }
+        if let Some((orig_idx, true)) = self.cursor_file_info() {
+            let _ = self.fs.select(orig_idx);
+            self.fs.enter_selected();
+            self.search_query.clear();
+            self.selected_index = None;
+            self.reset_cursor();
+        }
     }
 
     // Selection / marking
-
     fn toggle_selection(&mut self) {
         if let Some((orig_idx, _)) = self.cursor_file_info() {
             if self.selected_index == Some(orig_idx) {
@@ -290,7 +276,6 @@ impl App {
     }
 
     // File operations
-
     fn copy_marked(&mut self, is_copy: bool) {
         if let Some(idx) = self.selected_index {
             let _ = self.fs.select(idx);
@@ -298,70 +283,67 @@ impl App {
         }
     }
 
-
-    fn paste(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
-        let term_ptr = terminal as *mut Terminal<CrosstermBackend<Stdout>>;
+    fn paste(&mut self, scr: &mut Screen) {
+        let scr_ptr  = scr  as *mut Screen;
         let self_ptr = self as *mut App;
 
         self.fs.paste(move |path, is_dir| {
-            let terminal = unsafe { &mut *term_ptr };
-            let app      = unsafe { &mut *self_ptr };
+            let scr  = unsafe { &mut *scr_ptr };
+            let app  = unsafe { &mut *self_ptr };
 
             let mut dialog = DuplicateDialog::new(path.clone(), is_dir);
 
             loop {
-                terminal.draw(|frame| {
-                    app.ui(frame);
-                    Self::render_dialog(frame, &dialog);
-                }).unwrap();
+                app.draw(scr);
+                app.draw_duplicate_dialog(scr, &dialog);
+                scr.present();
 
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind != KeyEventKind::Press { continue; }
+                let key = match read_key() {
+                    Ok(k)  => k,
+                    Err(_) => return (DuplicatedFileHandleOps::Cancel, true),
+                };
 
-                    // Rename sub-mode
-                    if dialog.rename_input.is_some() {
-                        match key.code {
-                            KeyCode::Char(c)   => { dialog.rename_input.as_mut().unwrap().push(c); }
-                            KeyCode::Backspace => { dialog.rename_input.as_mut().unwrap().pop(); }
-                            KeyCode::Enter => {
-                                return (Self::handler_from_dialog(&dialog), dialog.apply_to_all);
-                            }
-                            KeyCode::Esc => { dialog.rename_input = None; }
-                            _ => {}
+                // Rename sub-mode: collect the new name
+                if dialog.rename_input.is_some() {
+                    match key {
+                        KeyCode::Char(c)   => { dialog.rename_input.as_mut().unwrap().push(c); }
+                        KeyCode::Backspace => { dialog.rename_input.as_mut().unwrap().pop(); }
+                        KeyCode::Enter     => {
+                            return (Self::handler_from_dialog(&dialog), dialog.apply_to_all);
                         }
-                        continue;
-                    }
-
-                    // Normal dialog navigation
-                    match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if dialog.cursor + 1 < dialog.options().len() {
-                                dialog.cursor += 1;
-                            }
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            if dialog.cursor > 0 { dialog.cursor -= 1; }
-                        }
-                        KeyCode::Char('a') | KeyCode::Char(' ') => {
-                            dialog.apply_to_all = !dialog.apply_to_all;
-                        }
-                        KeyCode::Enter => {
-                            if dialog.cursor == 1 {
-                                // Rename: collect name first
-                                let default = path.file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                dialog.rename_input = Some(default);
-                            } else {
-                                return (Self::handler_from_dialog(&dialog), dialog.apply_to_all);
-                            }
-                        }
-                        KeyCode::Esc => {
-                            // Cancel entire paste
-                            return (DuplicatedFileHandleOps::Cancel, true);
-                        }
+                        KeyCode::Esc       => { dialog.rename_input = None; }
                         _ => {}
                     }
+                    continue;
+                }
+
+                // Normal dialog navigation
+                match key {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if dialog.cursor + 1 < dialog.options().len() {
+                            dialog.cursor += 1;
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if dialog.cursor > 0 { dialog.cursor -= 1; }
+                    }
+                    KeyCode::Char('a') | KeyCode::Char(' ') => {
+                        dialog.apply_to_all = !dialog.apply_to_all;
+                    }
+                    KeyCode::Enter => {
+                        if dialog.cursor == 1 {
+                            let default = path.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            dialog.rename_input = Some(default);
+                        } else {
+                            return (Self::handler_from_dialog(&dialog), dialog.apply_to_all);
+                        }
+                    }
+                    KeyCode::Esc => {
+                        return (DuplicatedFileHandleOps::Cancel, true);
+                    }
+                    _ => {}
                 }
             }
         });
@@ -392,7 +374,6 @@ impl App {
 
     fn start_rename(&mut self) {
         let Some(orig_idx) = self.selected_index else { return };
-
         if let Some(path) = self.fs.get_file(orig_idx) {
             self.input_buffer = path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -415,8 +396,7 @@ impl App {
         }
     }
 
-    // Helpers
-
+    // Helpers 
     fn filtered_files(&self) -> Vec<(usize, &PathBuf)> {
         self.fs
             .files()
@@ -436,197 +416,123 @@ impl App {
 
     fn cursor_file_info(&self) -> Option<(usize, bool)> {
         let filtered = self.filtered_files();
-        self.table_state
-            .selected()
-            .and_then(|i| filtered.get(i))
-            .map(|(orig, path)| (*orig, path.is_dir()))
+        filtered.get(self.cursor).map(|(orig, path)| (*orig, path.is_dir()))
     }
 
     fn reset_cursor(&mut self) {
-        let filtered = self.filtered_files();
-        self.table_state
-            .select(if filtered.is_empty() { None } else { Some(0) });
+        let len = self.filtered_files().len();
+        self.cursor = if len == 0 { 0 } else { self.cursor.min(len - 1) };
     }
 
-    // UI
+    // Drawing
+    // Full-frame render.  Called every event loop iteration.
+    fn draw(&mut self, scr: &mut Screen) {
+        scr.resize();
+        scr.clear_all();
 
-    fn ui(&mut self, frame: &mut Frame) {
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
-            .split(frame.area());
+        let cols = scr.cols;
+        let rows = scr.rows;
+        let left_w     = cols / 2;
+        let right_w    = cols - left_w;
+        let pane_h     = rows.saturating_sub(3);
+        let status_row = rows.saturating_sub(2);
+        let filtered   = self.filtered_files();
+        let total      = filtered.len();
 
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(outer[0]);
-
-        self.render_file_list(frame, panes[0]);
-        self.render_preview(frame, panes[1]);
-        self.render_status_bar(frame, outer[1]);
-    }
-
-    // Duplicate dialog
-
-    fn render_dialog(frame: &mut Frame, dialog: &DuplicateDialog) {
-        let area = frame.area();
-        let w = 52u16.min(area.width.saturating_sub(4));
-        let rename_rows: u16 = if dialog.rename_input.is_some() { 2 } else { 0 };
-        let h = (7 + dialog.options().len() as u16 + rename_rows)
-            .min(area.height.saturating_sub(2));
-        let x = (area.width.saturating_sub(w)) / 2;
-        let y = (area.height.saturating_sub(h)) / 2;
-        let popup_area = Rect::new(x, y, w, h);
-
-        frame.render_widget(Clear, popup_area);
-
-        let filename = dialog.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| dialog.path.display().to_string());
-
-        let title = if dialog.mode == DuplicateDialogMode::File {
-            "Duplicate File"
-        } else {
-            "Duplicate Directory"
+        let cursor = CursorInfo {
+            orig_idx: filtered.get(self.cursor).map(|(i, _)| *i),
+            pos:      if total == 0 { 0 } else { self.cursor + 1 },
+            total,
         };
+        
+        self.draw_file_list(scr, 1, 1, left_w, pane_h);
+        self.draw_preview(scr, left_w + 1, 1, right_w, pane_h);
+        self.draw_status_bar(scr, 1, status_row, cols, cursor);
 
-        let mut lines: Vec<Line> = Vec::new();
-
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(&filename, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(" already exists"),
-        ]));
-        lines.push(Line::raw(""));
-
-        if dialog.rename_input.is_none() {
-            let toggle = if dialog.apply_to_all { "[*]" } else { "[ ]" };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(toggle, Style::default().fg(Color::Cyan)),
-                Span::raw("  Apply to all  "),
-                Span::styled("(a / space)", Style::default().fg(Color::DarkGray)),
-            ]));
-            lines.push(Line::raw(""));
-
-            for (i, label) in dialog.options().iter().enumerate() {
-                let selected = i == dialog.cursor;
-                let marker = if selected { "> " } else { "  " };
-                let style = if selected {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(format!("{marker}{label}"), style),
-                ]));
-            }
-        } else {
-            let name = dialog.rename_input.as_deref().unwrap_or("");
-            lines.push(Line::from(vec![
-                Span::raw("  Rename to: "),
-                Span::styled(
-                    format!("{name}_"),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                format!(" {title} "),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ))
-            .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(Color::Red));
-
-        frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+        scr.present();
     }
 
     // Left pane: file list
-
-    fn render_file_list(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw_file_list(&mut self, scr: &mut Screen, col: u16, row: u16, w: u16, h: u16) {
         let filtered = self.filtered_files();
 
-        let rows: Vec<Row> = filtered
-            .iter()
-            .map(|(orig_idx, path)| {
-                let is_marked = self.selected_index == Some(*orig_idx);
-                let name = path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let name_style = if path.is_dir() {
-                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                let mark_cell = if is_marked {
-                    Cell::from(">").style(Style::default().fg(Color::Cyan))
-                } else {
-                    Cell::from(" ")
-                };
-                Row::new(vec![
-                    mark_cell,
-                    Cell::from(name).style(name_style),
-                    Cell::from(if path.is_dir() {
-                        "  —".to_string()
-                    } else {
-                        path.metadata()
-                            .map(|m| format_size(m.len()))
-                            .unwrap_or_else(|_| "?".to_string())
-                    }),
-                    Cell::from(file_type(path)),
-                ])
-            })
-            .collect();
-
+        // Title: current directory path, with optional search query suffix
         let mut title = self.fs.current_dir().display().to_string();
         if !self.search_query.is_empty() {
             title = format!("{} [/{}]", title, self.search_query);
         }
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(2),
-                Constraint::Min(20),
-                Constraint::Length(10),
-                Constraint::Length(7),
-            ],
-        )
-        .header(
-            Row::new(vec![" ", "Name", "Size", "Type"])
-                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
-        )
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .column_spacing(1);
+        // Build header row
+        let header = Row::new(vec![" ", "Name", "Size", "Type"])
+            .style(Style::new().fg(Color::Yellow).bold());
 
-        frame.render_stateful_widget(table, area, &mut self.table_state);
+        // Column layout: marker(2) | name(fill) | size(10) | type(7)
+        let col_widths = [
+            ColWidth::Fixed(2),
+            ColWidth::Fill,
+            ColWidth::Fixed(10),
+            ColWidth::Fixed(7),
+        ];
+
+        // Build data rows
+        let rows_data: Vec<Row> = filtered
+            .iter()
+            .map(|(orig_idx, path)| {
+                let is_marked = self.selected_index == Some(*orig_idx);
+
+                let mark_str = if is_marked { ">" } else { " " };
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let size_str = if path.is_dir() {
+                    "  —".to_string()
+                } else {
+                    path.metadata()
+                        .map(|m| format_size(m.len()))
+                        .unwrap_or_else(|_| "?".to_string())
+                };
+                let type_str = file_type(path);
+
+                let name_style = if path.is_dir() {
+                    Style::new().fg(Color::Blue).bold()
+                } else {
+                    Style::new()
+                };
+                let mark_style = if is_marked {
+                    Style::new().fg(Color::Cyan)
+                } else {
+                    Style::new()
+                };
+
+                Row::new(vec![mark_str, name.as_str(), size_str.as_str(), type_str])
+                    .cell_style(0, mark_style)
+                    .cell_style(1, name_style)
+            })
+            .collect();
+
+        render_table(
+            scr,
+            Rect::new(col, row, w, h),
+            &title,
+            &header,
+            &rows_data,
+            &col_widths,
+            Some(self.cursor),
+        );
     }
 
     // Right pane: preview
 
-    fn render_preview(&self, frame: &mut Frame, area: Rect) {
+    fn draw_preview(&self, scr: &mut Screen, col: u16, row: u16, w: u16, h: u16) {
+        let area = Rect::new(col, row, w, h);
+
         let Some((orig_idx, is_dir)) = self.cursor_file_info() else {
-            frame.render_widget(
-                Paragraph::new("(empty)")
-                    .block(Block::default().borders(Borders::ALL).title("Preview")),
-                area,
-            );
+            render_paragraph(scr, area, "Preview", "(empty)", Style::new(), Style::new());
             return;
         };
 
         let Some(file) = self.fs.get_file(orig_idx) else {
-            frame.render_widget(
-                Paragraph::new("(no file)")
-                    .block(Block::default().borders(Borders::ALL).title("Preview")),
-                area,
-            );
+            render_paragraph(scr, area, "Preview", "(no file)", Style::new(), Style::new());
             return;
         };
 
@@ -635,42 +541,73 @@ impl App {
             .unwrap_or_default();
 
         if is_dir {
-            self.render_dir_preview(frame, area, file, &title);
+            self.draw_dir_preview(scr, area, file, &title);
         } else {
-            let desc = self.fs.get_description(orig_idx);
-            let text = desc.to_string_lossy().into_owned();
-            let size_str = file.metadata()
-                .map(|m| format_size(m.len()))
-                .unwrap_or_else(|_| "?".to_string());
-            let content = format!("Size: {}\n{}", size_str, text);
-            frame.render_widget(
-                Paragraph::new(content)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(title)
-                            .border_style(Style::default().fg(Color::DarkGray)),
-                    )
-                    .style(Style::default().fg(Color::Gray)),
-                area,
-            );
+            self.draw_file_preview(scr, area, file, &title);
         }
     }
 
-    fn render_dir_preview(&self, frame: &mut Frame, area: Rect, dir: &PathBuf, title: &str) {
+    /// Preview for a regular file.
+    ///
+    /// Text files (valid UTF-8 header): show file content.
+    /// Binary files: show file-type hint from extension + `<binary>`.
+    /// Symlinks: show the link target.
+    fn draw_file_preview(&self, scr: &mut Screen, area: Rect, file: &PathBuf, title: &str) {
+        let size_str = file.metadata()
+            .map(|m| format_size(m.len()))
+            .unwrap_or_else(|_| "?".to_string());
+
+        // Probe the first 512 bytes to distinguish text from binary
+        let mut buf = [0u8; 512];
+        let n = std::fs::File::open(file)
+            .and_then(|mut f| f.read(&mut buf))
+            .unwrap_or(0);
+
+        let content = if file.is_symlink() {
+            let target = std::fs::read_link(file)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            format!("Size: {}\nsymlink -> {}", size_str, target)
+        } else if n == 0 || std::str::from_utf8(&buf[..n]).is_ok() {
+            // Valid UTF-8 — treat as text and show the full content
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            format!("Size: {}\n\n{}", size_str, text)
+        } else {
+            // Binary — show extension-based description
+            let ext = file.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!("{} file", e))
+                .unwrap_or_else(|| "binary".to_string());
+            format!("Size: {}\n{}\n<binary>", size_str, ext)
+        };
+
+        render_paragraph(
+            scr, area, title,
+            &content,
+            Style::new().fg(Color::Gray),
+            Style::new().fg(Color::DarkGray),
+        );
+    }
+
+    fn draw_dir_preview(
+        &self,
+        scr:   &mut Screen,
+        area:  Rect,
+        dir:   &PathBuf,
+        title: &str,
+    ) {
         use std::fs;
 
-        let entries: Vec<ListItem> = match fs::read_dir(dir) {
+        let items: Vec<(String, Style)> = match fs::read_dir(dir) {
             Err(_) => {
-                frame.render_widget(
-                    Paragraph::new("(permission denied)")
-                        .block(Block::default().borders(Borders::ALL).title(title)),
-                    area,
+                render_paragraph(
+                    scr, area, title,
+                    "(permission denied)", Style::new(), Style::new(),
                 );
                 return;
             }
             Ok(rd) => {
-                let mut items: Vec<(String, bool)> = rd
+                let mut entries: Vec<(String, bool)> = rd
                     .filter_map(|e| e.ok())
                     .filter_map(|e| {
                         let name = e.file_name().to_string_lossy().into_owned();
@@ -680,41 +617,44 @@ impl App {
                     })
                     .collect();
 
-                items.sort_by(|(na, da), (nb, db)| match (da, db) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => na.cmp(nb),
+                entries.sort_by(|(na, da), (nb, db)| {
+                    match (da, db) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => na.cmp(nb),
+                    }
                 });
 
-                items.into_iter().map(|(name, is_dir)| {
+                entries.into_iter().map(|(name, is_dir)| {
+                    let prefix = if is_dir { "> " } else { "  " };
                     let style = if is_dir {
-                        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+                        Style::new().fg(Color::Blue).bold()
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::new().fg(Color::Gray)
                     };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(if is_dir { "> " } else { "  " }, style),
-                        Span::styled(name, style),
-                    ]))
+                    (format!("{}{}", prefix, name), style)
                 }).collect()
             }
         };
 
-        frame.render_widget(
-            List::new(entries).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(Style::default().fg(Color::Blue)),
-            ),
-            area,
+        render_list(
+            scr, area, title,
+            &items,
+            Style::new().fg(Color::Blue),
         );
     }
 
-    // Status bar 
-
-    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let (title, content, color) = match self.input_context {
+    // Status bar
+    fn draw_status_bar(
+        &self,
+        scr:    &mut Screen,
+        col:    u16,
+        row:    u16,
+        w:      u16,
+        cursor: CursorInfo,
+    ) {
+        // Left: state / prompt
+        let (title, left_content, color) = match self.input_context {
             InputContext::Search => (
                 "Search",
                 format!("{}_", self.input_buffer),
@@ -767,12 +707,98 @@ impl App {
             }
         };
 
-        frame.render_widget(
-            Paragraph::new(content)
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .style(Style::default().fg(color)),
-            area,
+        // Right: permissions + position
+        // Use symlink_metadata so symlinks show 'l' instead of following the link.
+        let perms = cursor.orig_idx
+            .and_then(|idx| self.fs.get_file(idx))
+            .and_then(|path| path.symlink_metadata().ok())
+            .map(|m| format_permissions(m.permissions().mode()))
+            .unwrap_or_else(|| "----------".to_string());
+
+        let right = format!("{}  {}/{}", perms, cursor.pos, cursor.total);
+
+        // Draw border + left content first
+        render_status_bar(scr, col, row, w, title, &left_content, Style::new().fg(color));
+
+        // Overwrite the right portion of the inner row with the right-aligned string.
+        // Inner area: columns [col+1 .. col+w-1], row+1.
+        let inner_w   = w.saturating_sub(2) as usize;
+        let right_len = right.len().min(inner_w);
+        let right_col = col + 1 + (inner_w - right_len) as u16;
+        scr.print_styled(
+            right_col, row + 1,
+            &right,
+            Style::new().fg(Color::DarkGray),
+            right_len as u16,
         );
+    }
+
+    // Duplicate dialog
+    fn draw_duplicate_dialog(&self, scr: &mut Screen, dialog: &DuplicateDialog) {
+        let filename = dialog.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dialog.path.display().to_string());
+
+        let title = if dialog.mode == DuplicateDialogMode::File {
+            " Duplicate File "
+        } else {
+            " Duplicate Directory "
+        };
+
+        let border_style = Style::new().fg(Color::Red).bold();
+        let mut lines: Vec<DialogLine> = Vec::new();
+
+        // " <filename> already exists"
+        lines.push(
+            DialogLine::plain("  ")
+                .push(&filename, Style::new().fg(Color::Yellow).bold())
+                .push(" already exists", Style::new()),
+        );
+        lines.push(DialogLine::empty());
+
+        if dialog.rename_input.is_none() {
+            // Apply-to-all toggle
+            let toggle = if dialog.apply_to_all { "[*]" } else { "[ ]" };
+            lines.push(
+                DialogLine::plain("  ")
+                    .push(toggle, Style::new().fg(Color::Cyan))
+                    .push("  Apply to all  ", Style::new())
+                    .push("(a / space)", Style::new().fg(Color::DarkGray)),
+            );
+            lines.push(DialogLine::empty());
+
+            // Option list
+            for (i, label) in dialog.options().iter().enumerate() {
+                let selected = i == dialog.cursor;
+                let marker = if selected { "> " } else { "  " };
+                let style = if selected {
+                    Style::new().fg(Color::White).bold().reverse()
+                } else {
+                    Style::new().fg(Color::Gray)
+                };
+                lines.push(
+                    DialogLine::plain("  ")
+                        .push(format!("{}{}", marker, label), style),
+                );
+            }
+        } else {
+            let name = dialog.rename_input.as_deref().unwrap_or("");
+            lines.push(
+                DialogLine::plain("  Rename to: ")
+                    .push(format!("{}_", name), Style::new().fg(Color::White).bold()),
+            );
+        }
+
+        // Dialog height: border(2) + "exists" line + blank + toggle section + options
+        let options_h = if dialog.rename_input.is_none() {
+            dialog.options().len() as u16 + 2 // toggle line + blank
+        } else {
+            1
+        };
+        let dialog_h = 2 + 2 + options_h;
+
+        render_dialog(scr, 52, dialog_h, title, &lines, border_style);
     }
 }
 
@@ -782,10 +808,10 @@ fn format_size(size: u64) -> String {
     if size == 0 { return "0 B".to_string(); }
     let units = ["B", "KB", "MB", "GB"];
     let mut value = size as f64;
-    let mut idx = 0;
+    let mut idx   = 0usize;
     while value >= 1024.0 && idx < units.len() - 1 {
         value /= 1024.0;
-        idx += 1;
+        idx   += 1;
     }
     format!("{:.1} {}", value, units[idx])
 }
@@ -793,9 +819,9 @@ fn format_size(size: u64) -> String {
 fn file_type(path: &PathBuf) -> &'static str {
     match metadata(path) {
         Err(_) => "ERR",
-        Ok(m) => {
+        Ok(m)  => {
             let ft = m.file_type();
-            if ft.is_dir()               { "DIR"  }
+            if      ft.is_dir()          { "DIR"  }
             else if ft.is_symlink()      { "LINK" }
             else if ft.is_fifo()         { "FIFO" }
             else if ft.is_char_device()  { "CHAR" }
@@ -804,4 +830,30 @@ fn file_type(path: &PathBuf) -> &'static str {
             else                         { "FILE" }
         }
     }
+}
+
+// Format a Unix mode bitmask as a `drwxrwxrwx`-style 10-character string.
+fn format_permissions(mode: u32) -> String {
+    let kind = match mode & 0o170000 {
+        0o040000 => 'd', // directory
+        0o120000 => 'l', // symlink
+        0o060000 => 'b', // block device
+        0o020000 => 'c', // char device
+        0o010000 => 'p', // fifo / named pipe
+        0o140000 => 's', // socket
+        _        => '-', // regular file
+    };
+
+    let bits = [
+        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'), // owner
+        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'), // group
+        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'), // other
+    ];
+
+    let mut s = String::with_capacity(10);
+    s.push(kind);
+    for (bit, ch) in bits {
+        s.push(if mode & bit != 0 { ch } else { '-' });
+    }
+    s
 }

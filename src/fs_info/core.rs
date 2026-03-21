@@ -1,14 +1,11 @@
-use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 // macros
 use crate::{
     check_or_abort_paste,
-    check_or_return,
-    check_or_return_with,
+    check_or_return
 };
 // modules
 use crate::fs_info::{
@@ -103,27 +100,6 @@ impl FileSystemCore {
         }
 
         self.refresh();
-    }
-
-    pub fn get_description(&self, index: usize) -> OsString {
-        match self.file_list.get(index) {
-            Some(file) => {
-                if file.is_dir() {
-                    check_or_return_with!(
-                        self,
-                        self.get_dir_preview::<&PathBuf, 10>(file),
-                        OsString::from_str("Fail to get preview").unwrap()
-                    )
-                } else {
-                    check_or_return_with!(
-                        self,
-                        self.get_file_description(file),
-                        OsString::from_str("Fail to get preview").unwrap()
-                    )
-                }
-            }
-            None => OsString::from_str("Nothing Here").unwrap(),
-        }
     }
 
     pub fn rename_selected(&mut self, new_name: &str) {
@@ -259,7 +235,8 @@ impl FileSystemCore {
     }
     
     pub fn remove_selected(&mut self) { 
-        todo!() 
+        let file = check_or_return!(self, "Remove", self.get_selected_file_info());
+        check_or_return!(self, "Remove", remove_file(file, file.is_dir()));
     }
 
     pub fn files(&self) -> &[PathBuf] { self.file_list.files() }
@@ -571,54 +548,10 @@ impl FileSystemCore {
 
         Ok(())
     }
-
-    fn get_dir_preview<P, const CAP: u8>(&self, path: P) -> Result<OsString, io::Error>
-    where P: AsRef<Path>,
-    {
-        let mut preview = OsString::new();
-        let mut counter = 0u8;
-        for entry in fs::read_dir(path)? {
-            match entry {
-                Ok(e) => {
-                    if counter >= CAP { break; }
-                    preview.push(e.file_name());
-                    preview.push("\n");
-                    counter += 1;
-                }
-                Err(_) => continue,
-            }
-        }
-        Ok(preview)
-    }
-
-    fn get_file_description<P>(&self, path: P) -> Result<OsString, io::Error>
-    where P: AsRef<Path>,
-    {
-        let path = path.as_ref();
-        let metadata = fs::metadata(path)?;
-        let description = if metadata.is_dir() {
-            "directory".to_string()
-        } else if metadata.is_symlink() {
-            match fs::read_link(path) {
-                Ok(target) => format!("symbolic link -> {}", target.display()),
-                Err(_)     => "symbolic link".to_string(),
-            }
-        } else {
-            match infer::get_from_path(path)? {
-                Some(kind) => kind.mime_type().to_string(),
-                None => path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| format!("{} file", e))
-                    .unwrap_or_else(|| "data".to_string()),
-            }
-        };
-        Ok(OsString::from(description))
-    }
 }
 
 
 // free functions
-
 fn remove_file<P: AsRef<Path>>(source: P, is_dir: bool) -> Result<(), io::Error> {
     if is_dir { fs::remove_dir_all(source) } else { fs::remove_file(source) }
 }
