@@ -1,12 +1,15 @@
 # npns
 A weak, low-efficient TUI file system browser which is 
 developed for poor nerds who want to learn embedded Linux but couldn't even afford an LCD screen (such as me).
-Built in Rust with Ratatui and Crossterm, it's a no-frills tool for browsing files over serial consoles or minimal terminals—perfect for cross-compiling kernels on a shoestring budget.
+Built in Rust, it's a no-frills tool for browsing files over serial consoles or minimal terminals—perfect for cross-compiling kernels on a shoestring budget.
+
+## Preview
+![demo](./assets/demo.png)
 
 ## Features
   - Supports most of the file operation, like Copy, Cut, Paste
   - could handle conflict file while pasting files
-  - couldn't operate `delete`, because Trash dir may not exist
+  - couldn't undo `delete`, because Trash dir may not exist
   - need not mouse, and arrow-key
   - probably crash if there are too many fils in current directory
   - can work on my machine(seriously I.MX6ULL MINI)
@@ -31,7 +34,7 @@ cargo build --target armv7-unknown-linux-musleabihf --release
 | Space     | Select current          | Toggle Selection                     |
 | c   x     | Copy / Cut file         | To clipboard                         |
 | v         | Paste                   | From clipboard to current/target dir |
-| d         | Delete                  | Unimplemented                        |
+| d         | Delete                  | Unrecoverable                        |
 | n   m     | New file / New dir      | Enter name in input mode             |
 | r         | Rename selected         | Pre-fills name in input mode         |
 | u         | Undo last operation     | Most ops                             |
