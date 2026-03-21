@@ -1,35 +1,27 @@
 mod fs_info;
+mod ui;
 mod app;
 
-use std::io;
 use crate::app::App;
-
-use crossterm::{
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
+use crate::ui::{RawMode, Screen};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_dir = std::env::current_dir()?;
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+
+    // Enter raw mode (restored automatically on drop)
+    let _raw = RawMode::enter()?;
+
+    // Allocate the screen (enters alternate screen, hides cursor)
+    let mut scr = Screen::init()?;
 
     let mut app = App::new(start_dir)?;
-    let res = app.run(&mut terminal);
+    let res = app.run(&mut scr);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // Leave alternate screen + restore cursor
+    scr.shutdown();
 
     if let Err(err) = res {
-        println!("{err:?}");
+        eprintln!("{err:?}");
     }
 
     Ok(())
