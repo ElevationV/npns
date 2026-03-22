@@ -4,7 +4,8 @@ use std::fs::metadata;
 use std::io::Read;
 use std::path::PathBuf;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 
 use crate::fs_info::{FileSystemCore, DuplicatedFileHandleOps, StateFlag};
 use crate::ui::{
@@ -17,13 +18,6 @@ use crate::ui::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-struct CursorInfo {
-    orig_idx: Option<usize>,
-    pos:      usize, 
-    total:    usize,
-}
-
-// Input context
 #[derive(PartialEq, Clone, Copy)]
 enum InputContext {
     None,
@@ -34,7 +28,6 @@ enum InputContext {
     Search,
 }
 
-// Duplicate dialog state
 #[derive(PartialEq, Clone)]
 enum DuplicateDialogMode {
     File,
@@ -69,20 +62,30 @@ impl DuplicateDialog {
     }
 }
 
-// App
 pub struct App {
     fs:             FileSystemCore,
-    cursor:         usize,         // index into filtered_files()
-    selected_index: Option<usize>, // marked file (orig index into fs.files())
+    cursor:         usize,
+    selected_index: Option<usize>,
     input_context:  InputContext,
     input_buffer:   String,
     show_hidden:    bool,
     search_query:   String,
     should_quit:    bool,
+
+    preview_tx:    Sender<Option<PathBuf>>,
+    preview_rx:    Receiver<String>,
+    preview_cache: String,
 }
 
 impl App {
     pub fn new(start_dir: PathBuf) -> Result<App> {
+        let (req_tx, req_rx) = mpsc::channel::<Option<PathBuf>>();
+        let (res_tx, res_rx) = mpsc::channel::<String>();
+
+        thread::spawn(move || {
+            preview_worker(req_rx, res_tx);
+        });
+
         Ok(App {
             fs:             FileSystemCore::init(start_dir),
             cursor:         0,
@@ -92,14 +95,25 @@ impl App {
             show_hidden:    false,
             search_query:   String::new(),
             should_quit:    false,
+            preview_tx:     req_tx,
+            preview_rx:     res_rx,
+            preview_cache:  String::new(),
         })
     }
 
-    // Main loop
+    fn request_preview(&self, path: Option<&PathBuf>) {
+        let _ = self.preview_tx.send(path.cloned());
+    }
+
     pub fn run(&mut self, scr: &mut Screen) -> Result<()> {
         self.reset_cursor();
+        self.request_preview(self.current_preview_path());
 
         loop {
+            if let Some(text) = self.poll_preview() {
+                self.preview_cache = text;
+            }
+
             self.draw(scr);
 
             if self.should_quit { break; }
@@ -114,7 +128,25 @@ impl App {
         Ok(())
     }
 
-    // Key dispatch
+    fn poll_preview(&self) -> Option<String> {
+        let mut last = None;
+        loop {
+            match self.preview_rx.try_recv() {
+                Ok(s)                       => { last = Some(s); }
+                Err(TryRecvError::Empty)    => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        last
+    }
+
+    fn current_preview_path(&self) -> Option<&PathBuf> {
+        self.cursor_file_info()
+            .and_then(|(orig_idx, is_dir)| {
+                if is_dir { None } else { self.fs.get_file(orig_idx) }
+            })
+    }
+
     fn handle_key(&mut self, key: KeyCode) {
         if self.input_context != InputContext::None {
             self.handle_input_mode(key);
@@ -123,7 +155,6 @@ impl App {
         }
     }
 
-    // Input mode
     fn handle_input_mode(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char(c)   => { self.input_buffer.push(c); }
@@ -189,8 +220,9 @@ impl App {
         self.input_buffer.clear();
     }
 
-    // Normal mode
     fn handle_normal_mode(&mut self, key: KeyCode) {
+        let prev_cursor = self.cursor;
+
         match key {
             KeyCode::Char('j')                  => self.move_cursor(1),
             KeyCode::Char('k')                  => self.move_cursor(-1),
@@ -233,9 +265,13 @@ impl App {
 
             _ => {}
         }
+
+        if self.cursor != prev_cursor {
+            self.preview_cache.clear();
+            self.request_preview(self.current_preview_path());
+        }
     }
 
-    // Navigation
     fn move_cursor(&mut self, delta: i32) {
         let len = self.filtered_files().len();
         if len == 0 {
@@ -253,6 +289,8 @@ impl App {
         self.fs.parent_dir();
         self.selected_index = None;
         self.reset_cursor();
+        self.preview_cache.clear();
+        self.request_preview(self.current_preview_path());
     }
 
     fn enter_current(&mut self) {
@@ -262,10 +300,11 @@ impl App {
             self.search_query.clear();
             self.selected_index = None;
             self.reset_cursor();
+            self.preview_cache.clear();
+            self.request_preview(self.current_preview_path());
         }
     }
 
-    // Selection / marking
     fn toggle_selection(&mut self) {
         if let Some((orig_idx, _)) = self.cursor_file_info() {
             if self.selected_index == Some(orig_idx) {
@@ -276,7 +315,6 @@ impl App {
         }
     }
 
-    // File operations
     fn copy_marked(&mut self, is_copy: bool) {
         if let Some(idx) = self.selected_index {
             let _ = self.fs.select(idx);
@@ -304,7 +342,6 @@ impl App {
                     Err(_) => return (DuplicatedFileHandleOps::Cancel, true),
                 };
 
-                // Rename sub-mode: collect the new name
                 if dialog.rename_input.is_some() {
                     match key {
                         KeyCode::Char(c)   => { dialog.rename_input.as_mut().unwrap().push(c); }
@@ -318,7 +355,6 @@ impl App {
                     continue;
                 }
 
-                // Normal dialog navigation
                 match key {
                     KeyCode::Char('j') | KeyCode::Down => {
                         if dialog.cursor + 1 < dialog.options().len() {
@@ -383,21 +419,23 @@ impl App {
         }
     }
 
-    // Search / filter
     fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.search_query.clear();
         self.reset_cursor();
+        self.preview_cache.clear();
+        self.request_preview(self.current_preview_path());
     }
 
     fn clear_search(&mut self) {
         if !self.search_query.is_empty() {
             self.search_query.clear();
             self.reset_cursor();
+            self.preview_cache.clear();
+            self.request_preview(self.current_preview_path());
         }
     }
 
-    // Helpers 
     fn filtered_files(&self) -> Vec<(usize, &PathBuf)> {
         self.fs
             .files()
@@ -425,49 +463,41 @@ impl App {
         self.cursor = if len == 0 { 0 } else { self.cursor.min(len - 1) };
     }
 
-    // Drawing
-    // Full-frame render.  Called every event loop iteration.
     fn draw(&mut self, scr: &mut Screen) {
         scr.resize();
         scr.clear_all();
 
         let cols = scr.cols;
         let rows = scr.rows;
+
         let left_w     = cols / 2;
         let right_w    = cols - left_w;
         let pane_h     = rows.saturating_sub(3);
         let status_row = rows.saturating_sub(2);
-        let filtered   = self.filtered_files();
-        let total      = filtered.len();
 
-        let cursor = CursorInfo {
-            orig_idx: filtered.get(self.cursor).map(|(i, _)| *i),
-            pos:      if total == 0 { 0 } else { self.cursor + 1 },
-            total,
-        };
-        
+        let filtered        = self.filtered_files();
+        let total           = filtered.len();
+        let pos             = if total == 0 { 0 } else { self.cursor + 1 };
+        let cursor_orig_idx = filtered.get(self.cursor).map(|(i, _)| *i);
+
         self.draw_file_list(scr, 1, 1, left_w, pane_h);
         self.draw_preview(scr, left_w + 1, 1, right_w, pane_h);
-        self.draw_status_bar(scr, 1, status_row, cols, cursor);
+        self.draw_status_bar(scr, 1, status_row, cols, cursor_orig_idx, pos, total);
 
         scr.present();
     }
 
-    // Left pane: file list
     fn draw_file_list(&mut self, scr: &mut Screen, col: u16, row: u16, w: u16, h: u16) {
         let filtered = self.filtered_files();
 
-        // Title: current directory path, with optional search query suffix
         let mut title = self.fs.current_dir().display().to_string();
         if !self.search_query.is_empty() {
             title = format!("{} [/{}]", title, self.search_query);
         }
 
-        // Build header row
         let header = Row::new(vec![" ", "Name", "Size", "Type"])
             .style(Style::new().fg(Color::Yellow).bold());
 
-        // Column layout: marker(2) | name(fill) | size(10) | type(7)
         let col_widths = [
             ColWidth::Fixed(2),
             ColWidth::Fill,
@@ -475,7 +505,6 @@ impl App {
             ColWidth::Fixed(7),
         ];
 
-        // Build data rows
         let rows_data: Vec<Row> = filtered
             .iter()
             .map(|(orig_idx, path)| {
@@ -522,8 +551,6 @@ impl App {
         );
     }
 
-    // Right pane: preview
-
     fn draw_preview(&self, scr: &mut Screen, col: u16, row: u16, w: u16, h: u16) {
         let area = Rect::new(col, row, w, h);
 
@@ -548,50 +575,15 @@ impl App {
         }
     }
 
-    /// Preview for a regular file.
-    ///
-    /// Text files (valid UTF-8 header): show file content.
-    /// Binary files: show file-type hint from extension + `<binary>`.
-    /// Symlinks: show the link target.
     fn draw_file_preview(&self, scr: &mut Screen, area: Rect, file: &PathBuf, title: &str) {
-        let size_str = file.metadata()
+        let size_str = file.symlink_metadata()
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
-        let meta = file.symlink_metadata().ok();
-        let is_regular = meta.as_ref()
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
-        
-        let mut buf = [0u8; 512];
-        let n = if is_regular {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(file)
-                .and_then(|mut f| f.read(&mut buf))
-                .unwrap_or(0)
+        let content = if self.preview_cache.is_empty() {
+            format!("Size: {}\n\nLoading...", size_str)
         } else {
-            0
-        };
-
-        let content = if file.is_symlink() {
-            let target = std::fs::read_link(file)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "?".to_string());
-            format!("Size: {}\nsymlink -> {}", size_str, target)
-        } else if n == 0 || std::str::from_utf8(&buf[..n]).is_ok() {
-            // Valid UTF-8 — treat as text and show the full content
-            let inner_h = area.h.saturating_sub(4) as usize;
-            let text = read_text_preview(file, inner_h);
-            format!("Size: {}\n\n{}", size_str, text)
-        } else {
-            // Binary — show extension-based description
-            let ext = file.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| format!("{} file", e))
-                .unwrap_or_else(|| "binary".to_string());
-            format!("Size: {}\n{}\n<binary>", size_str, ext)
+            format!("Size: {}\n\n{}", size_str, self.preview_cache)
         };
 
         render_paragraph(
@@ -657,16 +649,16 @@ impl App {
         );
     }
 
-    // Status bar
     fn draw_status_bar(
         &self,
-        scr:    &mut Screen,
-        col:    u16,
-        row:    u16,
-        w:      u16,
-        cursor: CursorInfo,
+        scr:             &mut Screen,
+        col:             u16,
+        row:             u16,
+        w:               u16,
+        cursor_orig_idx: Option<usize>,
+        pos:             usize,
+        total:           usize,
     ) {
-        // Left: state / prompt
         let (title, left_content, color) = match self.input_context {
             InputContext::Search => (
                 "Search",
@@ -720,21 +712,16 @@ impl App {
             }
         };
 
-        // Right: permissions + position
-        // Use symlink_metadata so symlinks show 'l' instead of following the link.
-        let perms = cursor.orig_idx
+        let perms = cursor_orig_idx
             .and_then(|idx| self.fs.get_file(idx))
             .and_then(|path| path.symlink_metadata().ok())
             .map(|m| format_permissions(m.permissions().mode()))
             .unwrap_or_else(|| "----------".to_string());
 
-        let right = format!("{}  {}/{}", perms, cursor.pos, cursor.total);
+        let right = format!("{}  {}/{}", perms, pos, total);
 
-        // Draw border + left content first
         render_status_bar(scr, col, row, w, title, &left_content, Style::new().fg(color));
 
-        // Overwrite the right portion of the inner row with the right-aligned string.
-        // Inner area: columns [col+1 .. col+w-1], row+1.
         let inner_w   = w.saturating_sub(2) as usize;
         let right_len = right.len().min(inner_w);
         let right_col = col + 1 + (inner_w - right_len) as u16;
@@ -746,7 +733,6 @@ impl App {
         );
     }
 
-    // Duplicate dialog
     fn draw_duplicate_dialog(&self, scr: &mut Screen, dialog: &DuplicateDialog) {
         let filename = dialog.path
             .file_name()
@@ -762,7 +748,6 @@ impl App {
         let border_style = Style::new().fg(Color::Red).bold();
         let mut lines: Vec<DialogLine> = Vec::new();
 
-        // " <filename> already exists"
         lines.push(
             DialogLine::plain("  ")
                 .push(&filename, Style::new().fg(Color::Yellow).bold())
@@ -771,7 +756,6 @@ impl App {
         lines.push(DialogLine::empty());
 
         if dialog.rename_input.is_none() {
-            // Apply-to-all toggle
             let toggle = if dialog.apply_to_all { "[*]" } else { "[ ]" };
             lines.push(
                 DialogLine::plain("  ")
@@ -781,7 +765,6 @@ impl App {
             );
             lines.push(DialogLine::empty());
 
-            // Option list
             for (i, label) in dialog.options().iter().enumerate() {
                 let selected = i == dialog.cursor;
                 let marker = if selected { "> " } else { "  " };
@@ -792,20 +775,19 @@ impl App {
                 };
                 lines.push(
                     DialogLine::plain("  ")
-                        .push(format!("{}{}", marker, label), style),
+                        .push(&format!("{}{}", marker, label), style),
                 );
             }
         } else {
             let name = dialog.rename_input.as_deref().unwrap_or("");
             lines.push(
                 DialogLine::plain("  Rename to: ")
-                    .push(format!("{}_", name), Style::new().fg(Color::White).bold()),
+                    .push(&format!("{}_", name), Style::new().fg(Color::White).bold()),
             );
         }
 
-        // Dialog height: border(2) + "exists" line + blank + toggle section + options
         let options_h = if dialog.rename_input.is_none() {
-            dialog.options().len() as u16 + 2 // toggle line + blank
+            dialog.options().len() as u16 + 2
         } else {
             1
         };
@@ -815,7 +797,97 @@ impl App {
     }
 }
 
-// Utility functions
+fn preview_worker(rx: Receiver<Option<PathBuf>>, tx: Sender<String>) {
+    loop {
+        let path = match recv_latest(&rx) {
+            Some(p) => p,
+            None    => return,
+        };
+
+        let result = match path {
+            None       => String::new(),
+            Some(path) => read_file_preview(&path),
+        };
+
+        if tx.send(result).is_err() {
+            return;
+        }
+    }
+}
+
+fn recv_latest(rx: &Receiver<Option<PathBuf>>) -> Option<Option<PathBuf>> {
+    let mut last = None;
+    loop {
+        match rx.try_recv() {
+            Ok(v)                           => { last = Some(v); }
+            Err(TryRecvError::Empty)        => break,
+            Err(TryRecvError::Disconnected) => return None,
+        }
+    }
+    match last {
+        Some(v) => Some(v),
+        None    => match rx.recv() {
+            Ok(v)  => Some(v),
+            Err(_) => None,
+        }
+    }
+}
+
+fn read_file_preview(path: &PathBuf) -> String {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::io::{BufRead, BufReader};
+
+    if path.is_symlink() {
+        return std::fs::read_link(path)
+            .map(|p| format!("symlink -> {}", p.display()))
+            .unwrap_or_else(|_| "symlink -> ?".to_string());
+    }
+
+    let is_regular = path.symlink_metadata()
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false);
+
+    if !is_regular {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{} file", e))
+            .unwrap_or_else(|| "binary".to_string());
+        return ext;
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f)  => f,
+        Err(_) => return String::new(),
+    };
+
+    let mut reader = BufReader::new(file.take(64 * 1024));
+    let mut lines  = Vec::new();
+    let mut buf    = String::new();
+
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0)  => break,
+            Ok(_)  => {
+                if std::str::from_utf8(buf.as_bytes()).is_err() {
+                    let ext = path.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| format!("{} file", e))
+                        .unwrap_or_else(|| "binary".to_string());
+                    return format!("{}\n<binary>", ext);
+                }
+                lines.push(buf.trim_end_matches('\n').to_owned());
+            }
+            Err(_) => break,
+        }
+    }
+
+    lines.join("\n")
+}
 
 fn format_size(size: u64) -> String {
     if size == 0 { return "0 B".to_string(); }
@@ -845,22 +917,21 @@ fn file_type(path: &PathBuf) -> &'static str {
     }
 }
 
-// Format a Unix mode bitmask as a `drwxrwxrwx`-style 10-character string.
 fn format_permissions(mode: u32) -> String {
     let kind = match mode & 0o170000 {
-        0o040000 => 'd', // directory
-        0o120000 => 'l', // symlink
-        0o060000 => 'b', // block device
-        0o020000 => 'c', // char device
-        0o010000 => 'p', // fifo / named pipe
-        0o140000 => 's', // socket
-        _        => '-', // regular file
+        0o040000 => 'd',
+        0o120000 => 'l',
+        0o060000 => 'b',
+        0o020000 => 'c',
+        0o010000 => 'p',
+        0o140000 => 's',
+        _        => '-',
     };
 
     let bits = [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'), // owner
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'), // group
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'), // other
+        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
+        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
+        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
     ];
 
     let mut s = String::with_capacity(10);
@@ -869,35 +940,4 @@ fn format_permissions(mode: u32) -> String {
         s.push(if mode & bit != 0 { ch } else { '-' });
     }
     s
-}
-
-fn read_text_preview(path: &PathBuf, max_lines: usize) -> String {
-    use std::io::{BufRead, BufReader};
-        use std::os::unix::fs::OpenOptionsExt;
-    
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-        else {
-            return String::new();
-        };
-    
-        let mut reader = BufReader::new(file.take(64 * 1024));
-    let mut out = String::new();
-    let mut line = String::new();
-    let mut count = 0;
-
-    while count < max_lines {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,           // EOF
-            Ok(_) => {
-                out.push_str(&line);
-                count += 1;
-            }
-            Err(_) => break,
-        }
-    }
-    out
 }
