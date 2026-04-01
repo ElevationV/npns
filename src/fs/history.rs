@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use postcard::{from_bytes, to_allocvec};
-use crate::fs_info::operations::{OperationFS, OperationUnitFS};
+use crate::fs::operations::{OperationFS, OperationUnitFS};
 
 const MAGIC: [u8; 4] = *b"HST1";
 const VERSION: u8 = 1;
