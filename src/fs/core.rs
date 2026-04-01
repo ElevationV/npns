@@ -8,7 +8,7 @@ use crate::{
     check_or_return
 };
 // modules
-use crate::fs_info::{
+use crate::fs::{
     clipboard::Clipboard,
     duplicate_handler::{DuplicatedFileHandleOps, PasteAbort, ApplyToAll, FileConflictResult, DirConflictResult},
     file_list::FileList,
@@ -17,9 +17,9 @@ use crate::fs_info::{
     state::{FileSysState, StateFlag},
 };
 // functions
-use crate::fs_info::duplicate_handler::{handle_file_duplicate, handle_dir_duplicate};
+use crate::fs::duplicate_handler::{handle_file_duplicate, handle_dir_duplicate};
 
-use crate::fs_info::state::StateFlag::*;
+use crate::fs::state::StateFlag::*;
 
 // FileSystemCore
 pub struct FileSystemCore {
@@ -400,7 +400,7 @@ impl FileSystemCore {
 
     /// # Recursive copy/move of directory contents
     ///
-    /// THE ONLY FUNCTION that calls the callback (via `handle_file_duplicate` and `handle_dir_duplicate`)
+    /// __THE ONLY FUNCTION__ that calls the callback (via `handle_file_duplicate` and `handle_dir_duplicate`)
     ///
     /// Maintains ApplyToAll across the loop.  
     /// ApplyToAll is local to this call frame; 

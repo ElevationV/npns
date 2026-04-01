@@ -20,7 +20,7 @@ Just compile it as how you compile other embedded rust projects.
 and the given config is used for Arm-Linux. Just run the following command
 
 ```
-cargo build --target armv7-unknown-linux-musleabihf --release
+cargo +nightly build --release --target armv7-unknown-linux-musleabihf
 ```
 
 ## Keybindings

@@ -1,4 +1,4 @@
-mod fs_info;
+mod fs;
 mod ui;
 mod app;
 
