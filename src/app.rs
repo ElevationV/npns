@@ -3,13 +3,15 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use crate::fs::{FileSystemCore, DuplicatedFileHandleOps, StateFlag};
-use crate::ui::{read_key, KeyCode, Rect, Screen};
+use crate::ui::{read_key, read_key_timeout, KeyCode, Rect, Screen};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+// ── Input context ─────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
 enum InputContext {
@@ -21,14 +23,20 @@ enum InputContext {
     Search,
 }
 
+// ── Conflict dialog ───────────────────────────────────────────────────────────
+//
+// Paste can encounter files that already exist at the destination.
+// Rather than silently overwriting or failing, we stop and ask the user.
+// This struct holds the per-conflict UI state for the duration of one dialog.
+
 #[derive(PartialEq, Clone, Copy)]
 enum ConflictKind { File, Dir }
 
 struct ConflictDialog {
-    path: PathBuf,
-    kind: ConflictKind,
+    path:         PathBuf,
+    kind:         ConflictKind,
     apply_to_all: bool,
-    cursor: usize,
+    cursor:       usize,
     rename_input: Option<String>,
 }
 
@@ -46,7 +54,7 @@ impl ConflictDialog {
     fn options(&self) -> &'static [&'static str] {
         match self.kind {
             ConflictKind::File => &["Overwrite", "Rename", "Skip", "Cancel"],
-            ConflictKind::Dir => &["Write In",  "Rename", "Skip", "Cancel"],
+            ConflictKind::Dir  => &["Write In",  "Rename", "Skip", "Cancel"],
         }
     }
 
@@ -54,7 +62,7 @@ impl ConflictDialog {
         match self.cursor {
             0 => match self.kind {
                 ConflictKind::File => DuplicatedFileHandleOps::Overwrite,
-                ConflictKind::Dir => DuplicatedFileHandleOps::WriteIn,
+                ConflictKind::Dir  => DuplicatedFileHandleOps::WriteIn,
             },
             1 => DuplicatedFileHandleOps::Rename(
                 self.rename_input.clone().unwrap_or_default()
@@ -65,52 +73,28 @@ impl ConflictDialog {
     }
 }
 
-struct PreviewWorker {
-    request_tx: Sender<Option<PathBuf>>,
-    result_rx:  Receiver<String>,
-    cached:     String,
-}
-
-impl PreviewWorker {
-    fn spawn() -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<Option<PathBuf>>();
-        let (result_tx,  result_rx)  = mpsc::channel::<String>();
-        thread::spawn(move || run_preview_worker(request_rx, result_tx));
-        Self { request_tx, result_rx, cached: String::new() }
-    }
-
-    fn request(&self, path: Option<&Path>) {
-        let _ = self.request_tx.send(path.map(PathBuf::from));
-    }
-
-    fn poll(&mut self) {
-        loop {
-            match self.result_rx.try_recv() {
-                Ok(text)                        => { self.cached = text; }
-                Err(TryRecvError::Empty)        => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-    }
-
-    fn invalidate(&mut self) { self.cached.clear(); }
-    fn content(&self) -> &str { &self.cached }
-}
+// ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
     fs:            FileSystemCore,
+    // Position in the filtered view that is highlighted.
     list_pos:      usize,
+    // Unfiltered index of the entry marked for copy/cut/delete/rename.
     marked:        Option<usize>,
     input_context: InputContext,
     input_buffer:  String,
     show_hidden:   bool,
     search_query:  String,
     should_quit:   bool,
-    preview:       PreviewWorker,
+    // Filtered and sorted snapshot of fs.files(), rebuilt on directory changes.
+    // App owns this so draw methods can borrow it without touching fs.
     view:          Vec<PathBuf>,
+    // Signals run() that the view was just rebuilt and scroll_offset should
+    // reset to 0.  Set by reset_view(), cleared by run() after consuming it.
     view_changed:  bool,
 }
 
+// Event loop
 impl App {
     pub fn new(start_dir: PathBuf) -> Result<Self> {
         let mut app = Self {
@@ -122,34 +106,74 @@ impl App {
             show_hidden: false,
             search_query: String::new(),
             should_quit: false,
-            preview: PreviewWorker::spawn(),
             view: Vec::new(),
-            view_changed: false
+            view_changed: false,
         };
         app.rebuild_view();
-        app.preview.request(app.cursor_path());
         Ok(app)
     }
 
     pub fn run(&mut self, screen: &mut Screen) -> Result<()> {
-        let mut scroll_offset: usize = 0;
-    
+        // scroll_offset and preview state live here, not on App, because they
+        // are purely runtime concerns of the event loop and don't need to
+        // survive across resets or be visible to other methods.
+        let mut scroll_offset:   usize             = 0;
+        let mut preview_rx:      Option<Receiver<String>> = None;
+        let mut preview_content: String            = String::new();
+
+        // Kick off the first preview immediately.
+        if let Some(path) = self.cursor_path().map(PathBuf::from) {
+            let (tx, rx) = mpsc::channel();
+            preview_rx = Some(rx);
+            thread::spawn(move || { let _ = tx.send(read_file_preview(&path)); });
+        }
+
         loop {
-            self.preview.poll();
-            self.draw(screen, scroll_offset);
+            // Drain any finished preview result before drawing so the very
+            // first render after a cursor move already shows content if the
+            // thread finished quickly.
+            if let Some(rx) = &preview_rx && let Ok(text) = rx.try_recv() {
+                    preview_content = text;
+                    preview_rx = None;
+                }
+
+            self.draw(screen, scroll_offset, &preview_content);
             if self.should_quit { break; }
-    
-            let key = read_key()?;
+
+            // read_key_timeout returns None after ~20 ms with no input.
+            // This keeps the loop spinning so preview results are picked up
+            // even when the user isn't pressing anything.
+            let key = match read_key_timeout(20)? {
+                None      => continue,
+                Some(key) => key,
+            };
+
+            let prev_pos = self.list_pos;
+
             if key == KeyCode::Char('v') && self.input_context == InputContext::None {
                 self.paste(screen);
             } else {
                 self.handle_key(key);
             }
-    
+
+            // If the cursor moved, discard the old preview and request a new one.
+            // Replacing preview_rx drops the old Receiver, which causes the old
+            // thread's send to fail — no explicit cancellation needed.
+            if self.list_pos != prev_pos || self.view_changed {
+                preview_content.clear();
+                preview_rx = None;
+                if let Some(path) = self.cursor_path().map(PathBuf::from) {
+                    let (tx, rx) = mpsc::channel();
+                    preview_rx = Some(rx);
+                    thread::spawn(move || { let _ = tx.send(read_file_preview(&path)); });
+                }
+            }
+
             if self.view_changed {
                 scroll_offset = 0;
                 self.view_changed = false;
             } else {
+                // Keep cursor visible: only scroll when it leaves the window.
                 let visible_rows = screen.rows.saturating_sub(7) as usize;
                 if self.list_pos < scroll_offset {
                     scroll_offset = self.list_pos;
@@ -184,8 +208,8 @@ impl App {
         match self.input_context {
             InputContext::Search => {
                 self.search_query = input;
-                self.reset_view();
                 self.marked = None;
+                self.reset_view();
                 self.exit_input_mode();
             }
             InputContext::ConfirmDelete => {
@@ -224,11 +248,10 @@ impl App {
     }
 
     fn handle_normal_mode(&mut self, key: KeyCode) {
-        let prev_pos = self.list_pos;
         match key {
-            KeyCode::Char('j')                  => self.move_cursor(1),
-            KeyCode::Char('k')                  => self.move_cursor(-1),
-            KeyCode::Char('h')                  => self.go_parent_dir(),
+            KeyCode::Char('j') => self.move_cursor(1),
+            KeyCode::Char('k') => self.move_cursor(-1),
+            KeyCode::Char('h') => self.go_parent_dir(),
             KeyCode::Char('l') | KeyCode::Enter => self.enter_dir(),
 
             #[cfg(debug_assertions)]
@@ -239,17 +262,15 @@ impl App {
             KeyCode::Left  => self.go_parent_dir(),
             #[cfg(debug_assertions)]
             KeyCode::Right => self.enter_dir(),
-            
+
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('c') => self.copy_marked(true),
             KeyCode::Char('x') => self.copy_marked(false),
             KeyCode::Char('u') => self.fs.undo(),
             KeyCode::Char('r') => self.start_rename(),
-            KeyCode::Char('d') => {
-                if self.marked.is_some() {
-                    self.input_context = InputContext::ConfirmDelete;
-                    self.input_buffer.clear();
-                }
+            KeyCode::Char('d') if self.marked.is_some() => {
+                self.input_context = InputContext::ConfirmDelete;
+                self.input_buffer.clear();
             }
             KeyCode::Char('n') => {
                 self.input_context = InputContext::NewFile;
@@ -268,24 +289,18 @@ impl App {
                 self.input_context = InputContext::Search;
                 self.input_buffer.clear();
             }
-            KeyCode::Esc => {
-                if !self.search_query.is_empty() {
-                    self.search_query.clear();
-                    self.reset_view();
-                }
+            KeyCode::Esc if !self.search_query.is_empty() => {
+                self.search_query.clear();
+                self.reset_view();
             }
             KeyCode::Char('q') => { self.should_quit = true; }
             _ => {}
         }
-
-        if self.list_pos != prev_pos {
-            self.preview.invalidate();
-            self.preview.request(self.cursor_path());
-        }
     }
 }
 
-// File System Operations
+// Filesystem operations
+
 impl App {
     fn move_cursor(&mut self, delta: i32) {
         let len = self.view.len();
@@ -301,8 +316,6 @@ impl App {
         self.fs.parent_dir();
         self.marked = None;
         self.reset_view();
-        self.preview.invalidate();
-        self.preview.request(self.cursor_path());
     }
 
     fn enter_dir(&mut self) {
@@ -314,8 +327,6 @@ impl App {
         self.search_query.clear();
         self.marked = None;
         self.reset_view();
-        self.preview.invalidate();
-        self.preview.request(self.cursor_path());
     }
 
     fn toggle_mark(&mut self) {
@@ -340,18 +351,22 @@ impl App {
         }
     }
 
+    // Paste uses a synchronous blocking callback for conflict dialogs.
+    // The callback itself calls read_key (blocking) because during paste we
+    // don't need the 20ms refresh — we're waiting for the user to decide,
+    // not for a background thread.  Using raw pointers here is safe because
+    // the closure never outlives this stack frame and there is no threading.
     fn paste(&mut self, screen: &mut Screen) {
         let screen_ptr = screen as *mut Screen;
         let self_ptr   = self   as *mut App;
 
-        self.fs.paste(move |path, is_dir| {
+        self.fs.paste(move |path, is_dir| -> (DuplicatedFileHandleOps, bool) {
             let screen = unsafe { &mut *screen_ptr };
             let app    = unsafe { &mut *self_ptr };
-
             let mut dialog = ConflictDialog::new(path.clone(), is_dir);
 
             loop {
-                app.draw(screen, 0);
+                app.draw(screen, 0, "");
                 let filename = dialog.path.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
@@ -371,24 +386,20 @@ impl App {
 
                 if dialog.rename_input.is_some() {
                     match key {
-                        KeyCode::Char(c) => { dialog.rename_input.as_mut().unwrap().push(c); }
+                        KeyCode::Char(c)   => { dialog.rename_input.as_mut().unwrap().push(c); }
                         KeyCode::Backspace => { dialog.rename_input.as_mut().unwrap().pop(); }
-                        KeyCode::Enter => return (dialog.to_handler(), dialog.apply_to_all),
-                        KeyCode::Esc => { dialog.rename_input = None; }
+                        KeyCode::Enter     => return (dialog.to_handler(), dialog.apply_to_all),
+                        KeyCode::Esc       => { dialog.rename_input = None; }
                         _ => {}
                     }
                     continue;
                 }
 
                 match key {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if dialog.cursor + 1 < dialog.options().len() { 
-                            dialog.cursor += 1; 
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if dialog.cursor > 0 { dialog.cursor -= 1; }
-                    }
+                    KeyCode::Char('j') | KeyCode::Down
+                        if dialog.cursor + 1 < dialog.options().len() => { dialog.cursor += 1; }
+                    KeyCode::Char('k') | KeyCode::Up
+                        if dialog.cursor > 0 => { dialog.cursor -= 1; }
                     KeyCode::Char('a') | KeyCode::Char(' ') => {
                         dialog.apply_to_all = !dialog.apply_to_all;
                     }
@@ -430,7 +441,7 @@ impl App {
 
     fn reset_view(&mut self) {
         self.rebuild_view();
-        self.list_pos = 0;
+        self.list_pos    = 0;
         self.view_changed = true;
     }
 
@@ -439,6 +450,9 @@ impl App {
         self.fs.files().iter().position(|p| p == path).unwrap_or(0)
     }
 
+    // Returns the path under the cursor only when it is a regular file.
+    // Directories are previewed inline by build_dir_preview, not via the
+    // background thread, so they don't need a path here.
     fn cursor_path(&self) -> Option<&Path> {
         self.view.get(self.list_pos)
             .filter(|path| !path.is_dir())
@@ -446,18 +460,25 @@ impl App {
     }
 }
 
-// Draw UI
+// Draw
+
 impl App {
-    fn draw(&mut self, screen: &mut Screen, scroll_offset: usize) {
+    // preview_content is passed in from run() rather than stored on App
+    // because it belongs to the event loop, not to the application state.
+    fn draw(&mut self, screen: &mut Screen, scroll_offset: usize, preview_content: &str) {
         screen.resize();
         screen.clear_all();
+
+        // Layout: two panes fill rows 1..rows-3, status bar takes the last 3 rows.
         let pane_height = screen.rows.saturating_sub(3);
         let left_width  = screen.cols / 2;
         let right_width = screen.cols - left_width;
         let status_row  = screen.rows.saturating_sub(2);
+
         self.draw_file_list(screen, Rect::new(1, 1, left_width, pane_height), scroll_offset);
-        self.draw_preview(screen, Rect::new(left_width + 1, 1, right_width, pane_height));
+        self.draw_preview(screen, Rect::new(left_width + 1, 1, right_width, pane_height), preview_content);
         self.draw_status_bar(screen, Rect::new(1, status_row, screen.cols, 3));
+
         screen.present();
     }
 
@@ -476,7 +497,7 @@ impl App {
         screen.render_file_list(area, &view_refs, self.list_pos, scroll_offset, marked_view_pos, &title);
     }
 
-    fn draw_preview(&self, screen: &mut Screen, area: Rect) {
+    fn draw_preview(&self, screen: &mut Screen, area: Rect, preview_content: &str) {
         let Some(path) = self.view.get(self.list_pos) else {
             screen.render_preview(area, "Preview", "(empty)");
             return;
@@ -487,16 +508,19 @@ impl App {
             .unwrap_or_default();
 
         if path.is_dir() {
+            // Directory contents are fast to read synchronously; no thread needed.
             let content = build_dir_preview(path, self.show_hidden);
             screen.render_preview(area, &title, &content);
         } else {
+            // File content arrives asynchronously from the preview thread.
+            // While it hasn't arrived yet we show "Loading...".
             let size = path.symlink_metadata()
                 .map(|m| format_size(m.len()))
                 .unwrap_or_else(|_| "?".to_string());
-            let content = if self.preview.content().is_empty() {
+            let content = if preview_content.is_empty() {
                 format!("Size: {}\n\nLoading...", size)
             } else {
-                format!("Size: {}\n\n{}", size, self.preview.content())
+                format!("Size: {}\n\n{}", size, preview_content)
             };
             screen.render_preview(area, &title, &content);
         }
@@ -512,19 +536,16 @@ impl App {
             InputContext::NewFile       => format!("New file: {}_",     self.input_buffer),
             InputContext::NewDir        => format!("New dir: {}_",      self.input_buffer),
             InputContext::Rename        => format!("Rename to: {}_",    self.input_buffer),
-            InputContext::None          => {
+            InputContext::None => {
                 let mut parts: Vec<String> = Vec::new();
-
-                // Only surface errors; Ready and Operating are noise in the status bar.
+                // Only surface errors — Ready/Operating would just be noise here.
                 if self.fs.state_flag() == StateFlag::Error {
                     parts.push(format!("[ERR] {}", self.fs.state_info()));
                 }
                 if !self.search_query.is_empty() {
                     parts.push(format!("/{}", self.search_query));
                 }
-                if self.show_hidden {
-                    parts.push("hidden".to_string());
-                }
+                if self.show_hidden { parts.push("hidden".to_string()); }
                 if let Some(idx) = self.marked
                     && let Some(path) = self.fs.get_file(idx)
                 {
@@ -533,7 +554,6 @@ impl App {
                         .unwrap_or_default();
                     parts.push(format!("marked: {}", name));
                 }
-
                 if parts.is_empty() { "Ready".to_string() } else { parts.join("  │  ") }
             }
         };
@@ -544,41 +564,18 @@ impl App {
             .unwrap_or_else(|| "----------".to_string());
 
         let info = format!("{}  {}/{}", permissions, pos, total);
-
         screen.render_status_bar(area, &status, &info);
     }
 }
 
-fn run_preview_worker(requests: Receiver<Option<PathBuf>>, results: Sender<String>) {
-    loop {
-        let path = match recv_latest(&requests) {
-            Some(path) => path,
-            None       => return,
-        };
-        let text = match path {
-            None       => String::new(),
-            Some(path) => read_file_preview(&path),
-        };
-        if results.send(text).is_err() { return; }
-    }
-}
+// File reading
 
-fn recv_latest(rx: &Receiver<Option<PathBuf>>) -> Option<Option<PathBuf>> {
-    let first = rx.recv().ok()?;
-    let mut latest = first;
-    loop {
-        match rx.try_recv() {
-            Ok(newer)                       => { latest = newer; }
-            Err(TryRecvError::Empty)        => break,
-            Err(TryRecvError::Disconnected) => break,
-        }
-    }
-    Some(latest)
-}
-
+// Read up to 64 KB of a file for preview.
+// Runs on a background thread to avoid blocking the UI on slow or special
+// files (e.g. FIFOs, network mounts).  The caller discards the result if
+// the cursor has moved on before this finishes.
 fn read_file_preview(path: &Path) -> String {
     use std::io::{BufRead, BufReader};
-    use std::os::unix::fs::OpenOptionsExt;
 
     if path.is_symlink() {
         return std::fs::read_link(path)
@@ -593,11 +590,7 @@ fn read_file_preview(path: &Path) -> String {
             .unwrap_or_else(|| "special file".to_string());
     }
 
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-    {
+    let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(_)   => return String::new(),
     };
@@ -629,11 +622,11 @@ fn read_file_preview(path: &Path) -> String {
 
 fn build_dir_preview(path: &Path, show_hidden: bool) -> String {
     let mut entries: Vec<(String, bool)> = match std::fs::read_dir(path) {
-        Err(_)  => return "(permission denied)".to_string(),
+        Err(_)       => return "(permission denied)".to_string(),
         Ok(read_dir) => read_dir
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
-                let name  = entry.file_name().to_string_lossy().into_owned();
+                let name   = entry.file_name().to_string_lossy().into_owned();
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 if !show_hidden && name.starts_with('.') { return None; }
                 Some((name, is_dir))
@@ -645,7 +638,7 @@ fn build_dir_preview(path: &Path, show_hidden: bool) -> String {
         match (is_dir_a, is_dir_b) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => name_a.cmp(name_b),
+            _             => name_a.cmp(name_b),
         }
     });
 
@@ -656,6 +649,8 @@ fn build_dir_preview(path: &Path, show_hidden: bool) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+//Utilities
 
 fn format_size(bytes: u64) -> String {
     if bytes < 1_024 {
