@@ -11,7 +11,7 @@ use crate::ui::{read_key, read_key_timeout, KeyCode, Rect, Screen};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-// ── Input context ─────────────────────────────────────────────────────────────
+// Input context
 
 #[derive(PartialEq, Clone, Copy)]
 enum InputContext {
@@ -23,7 +23,7 @@ enum InputContext {
     Search,
 }
 
-// ── Conflict dialog ───────────────────────────────────────────────────────────
+// Conflict dialog
 //
 // Paste can encounter files that already exist at the destination.
 // Rather than silently overwriting or failing, we stop and ask the user.
@@ -33,7 +33,7 @@ enum InputContext {
 enum ConflictKind { File, Dir }
 
 struct ConflictDialog {
-    path:         PathBuf,
+    path: PathBuf,
     kind:         ConflictKind,
     apply_to_all: bool,
     cursor:       usize,
@@ -73,25 +73,25 @@ impl ConflictDialog {
     }
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
+// App
 
 pub struct App {
-    fs:            FileSystemCore,
+    fs: FileSystemCore,
     // Position in the filtered view that is highlighted.
-    list_pos:      usize,
+    list_pos: usize,
     // Unfiltered index of the entry marked for copy/cut/delete/rename.
-    marked:        Option<usize>,
+    marked: Option<usize>,
     input_context: InputContext,
-    input_buffer:  String,
-    show_hidden:   bool,
-    search_query:  String,
-    should_quit:   bool,
+    input_buffer: String,
+    show_hidden: bool,
+    search_query: String,
+    should_quit: bool,
     // Filtered and sorted snapshot of fs.files(), rebuilt on directory changes.
     // App owns this so draw methods can borrow it without touching fs.
-    view:          Vec<PathBuf>,
+    view:  Vec<PathBuf>,
     // Signals run() that the view was just rebuilt and scroll_offset should
-    // reset to 0.  Set by reset_view(), cleared by run() after consuming it.
-    view_changed:  bool,
+    // reset to 0. Set by reset_view(), cleared by run() after consuming it.
+    view_changed: bool,
 }
 
 // Event loop
@@ -117,9 +117,9 @@ impl App {
         // scroll_offset and preview state live here, not on App, because they
         // are purely runtime concerns of the event loop and don't need to
         // survive across resets or be visible to other methods.
-        let mut scroll_offset:   usize             = 0;
-        let mut preview_rx:      Option<Receiver<String>> = None;
-        let mut preview_content: String            = String::new();
+        let mut scroll_offset: usize = 0;
+        let mut preview_rx: Option<Receiver<String>> = None;
+        let mut preview_content: String = String::new();
 
         // Kick off the first preview immediately.
         if let Some(path) = self.cursor_path().map(PathBuf::from) {
@@ -144,7 +144,7 @@ impl App {
             // This keeps the loop spinning so preview results are picked up
             // even when the user isn't pressing anything.
             let key = match read_key_timeout(20)? {
-                None      => continue,
+                None => continue,
                 Some(key) => key,
             };
 
