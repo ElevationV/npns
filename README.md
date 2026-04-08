@@ -10,9 +10,10 @@ Built in Rust, it's a no-frills tool for browsing files over serial consoles or 
   - Supports most of the file operation, like Copy, Cut, Paste
   - could handle conflict file while pasting files
   - couldn't undo `delete`, because Trash dir may not exist
-  - need not mouse, and arrow-key
-  - probably crash if there are too many fils in current directory
+  - need not mouse, and arrow-key(bacause serial may unstable and truncate these keys(ANSI) into others)
+  - probably crash if there are too many fils in current directory(but who will put that mamy of files in a single diectory on their board)
   - can work on my machine(seriously I.MX6ULL MINI)
+  - about 100-200Kib under release mode
 
 ## Compile
 Just compile it as how you compile other embedded rust projects. 

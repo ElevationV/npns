@@ -3,18 +3,6 @@
 use std::io::{self, BufWriter, Write};
 use std::os::unix::io::RawFd;
 
-/// # Terminal Raw Mode
-/// 
-/// ## In this mode:
-/// - No input buffer, characters a delivered to the program immediately as they are typed without waiting for `ENTER`
-/// 
-/// - No echo. If you want it, then you have to implement it manually.
-/// 
-/// - no special control characters. Ctrl+C, Ctrl+Z, etc. are all treated as normal characters
-/// 
-/// ...
-/// 
-/// 
 pub struct RawMode {
     original: libc::termios,
     fd:       RawFd,
