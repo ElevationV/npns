@@ -65,7 +65,7 @@ impl Screen {
 
             let name = file_name_str(path);
             let size_text = if path.is_dir() {
-                pad_to_cols("—", SIZE_W)
+                pad_to_cols(" —", SIZE_W)
             } else {
                 pad_to_cols(&format_size(path), SIZE_W)
             };
@@ -142,13 +142,13 @@ fn format_size(path: &Path) -> String {
         Err(_) => return "?".to_string(),
     };
     if bytes < 1_024 {
-        format!("{:>6} B", bytes)
+        format!("{:<5}B", bytes)
     } else if bytes < 1_024 * 1_024 {
-        format!("{:>5.1} K", bytes as f64 / 1_024.0)
+        format!("{:<5.1}K", bytes as f64 / 1_024.0)
     } else if bytes < 1_024 * 1_024 * 1_024 {
-        format!("{:>5.1} M", bytes as f64 / (1_024.0 * 1_024.0))
+        format!("{:<5.1}M", bytes as f64 / (1_024.0 * 1_024.0))
     } else {
-        format!("{:>5.1} G", bytes as f64 / (1_024.0 * 1_024.0 * 1_024.0))
+        format!("{:<5.1}G", bytes as f64 / (1_024.0 * 1_024.0 * 1_024.0))
     }
 }
 
