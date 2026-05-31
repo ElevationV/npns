@@ -1,42 +1,36 @@
-use crate::ui::screen::{Color, Rect, Screen, Style, pad_to_cols};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style},
+    text::Span,
+    widgets::Widget,
+};
+use super::file_list::render_border;
 
-const STYLE_STATUS: Style = Style::new().fg(Color::Green);
-const STYLE_INFO: Style = Style::new().fg(Color::DarkGray);
+pub struct StatusBar<'a> {
+    pub status: &'a str,
+    pub info:   &'a str,
+}
 
-const TL: &str = "┌"; const TR: &str = "┐";
-const BL: &str = "└"; const BR: &str = "┘";
-const H:  &str = "─"; const V:  &str = "│";
-
-impl Screen {
-    pub fn render_status_bar(
-        &mut self,
-        area:   Rect,
-        status: &str,
-        info:   &str,
-    ) {
+impl Widget for StatusBar<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 3 || area.height < 3 { return; }
-        let inner_width = area.inner_width();
+        let inner = render_border(area, "", Color::Reset, buf);
+        let w = inner.width as usize;
 
-        self.apply_style(Style::new());
-        self.goto(area.col, area.row);
-        self.write_raw(TL);
-        for _ in 0..inner_width { self.write_raw(H); }
-        self.write_raw(TR);
+        let padded = pad(self.status, w);
+        buf.set_span(inner.x, inner.y,
+            &Span::styled(padded, Style::new().fg(Color::Green)), inner.width);
 
-        self.goto(area.col, area.row + 1);             self.write_raw(V);
-        self.goto(area.col + area.width - 1, area.row + 1); self.write_raw(V);
-
-        self.goto(area.col, area.row + 2);
-        self.write_raw(BL);
-        for _ in 0..inner_width { self.write_raw(H); }
-        self.write_raw(BR);
-        self.reset_style();
-
-        let padded = pad_to_cols(status, inner_width);
-        self.print_styled(area.col + 1, area.row + 1, &padded, STYLE_STATUS, inner_width);
-
-        let info_width = info.len().min(inner_width);
-        let right_col  = area.col + 1 + (inner_width - info_width) as u16;
-        self.print_styled(right_col, area.row + 1, info, STYLE_INFO, info_width);
+        let info_w = self.info.len().min(w);
+        let right_x = inner.x + (w - info_w) as u16;
+        buf.set_span(right_x, inner.y,
+            &Span::styled(self.info, Style::new().fg(Color::DarkGray)), info_w as u16);
     }
+}
+
+fn pad(s: &str, w: usize) -> String {
+    let mut out = s.chars().take(w).collect::<String>();
+    while out.len() < w { out.push(' '); }
+    out
 }

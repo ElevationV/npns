@@ -1,158 +1,148 @@
 use std::path::Path;
-use crate::ui::screen::{Color, Rect, Screen, Style, pad_to_cols, truncate_to_cols};
-
-const STYLE_HEADER: Style = Style::new().fg(Color::Yellow).bold();
-const STYLE_DIR: Style = Style::new().fg(Color::Blue).bold();
-const STYLE_MARKED: Style = Style::new().fg(Color::Cyan).bold();
-const STYLE_SELECTED: Style = Style::new().reverse();
-const STYLE_DIM: Style = Style::new().fg(Color::DarkGray);
-
-const TL: &str = "┌"; const TR: &str = "┐";
-const BL: &str = "└"; const BR: &str = "┘";
-const H:  &str = "─"; const V:  &str = "│";
-const ML: &str = "├"; const MR: &str = "┤";
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Span},
+    widgets::Widget,
+};
 
 const MARK_W: usize = 2;
 const SIZE_W: usize = 8;
 const TYPE_W: usize = 4;
 const GAPS:   usize = 3;
 
-impl Screen {
-    pub fn render_file_list(
-        &mut self,
-        area: Rect,
-        files: &[&Path],
-        cursor: usize,
-        scroll_offset: usize,
-        marked: Option<usize>,
-        title: &str,
-    ) {
+pub struct FileList<'a> {
+    pub files:         &'a [&'a Path],
+    pub cursor:        usize,
+    pub scroll_offset: usize,
+    pub marked:        Option<usize>,
+    pub title:         &'a str,
+}
+
+impl Widget for FileList<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 6 || area.height < 5 { return; }
 
-        self.draw_border(area, title);
+        let inner = render_border(area, self.title, Color::Reset, buf);
+        let inner_w = inner.width as usize;
+        let name_w  = inner_w.saturating_sub(MARK_W + SIZE_W + TYPE_W + GAPS);
 
-        let inner_width = area.inner_width();
-        let name_width  = inner_width.saturating_sub(MARK_W + SIZE_W + TYPE_W + GAPS);
+        let header_row = inner.y;
+        render_columns(buf, inner.x, header_row, name_w,
+            " ", "Name", "Size    ", "Type",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 
-        // Column start positions (1-based, relative to area.col + 1)
-        let col_mark = area.col + 1;
-        let col_name = col_mark + MARK_W as u16 + 1;
-        let col_size = col_name + name_width as u16 + 1;
-        let col_type = col_size + SIZE_W as u16 + 1;
+        let sep_y = inner.y + 1;
+        if sep_y < area.bottom() - 1 {
+            buf[(area.x, sep_y)].set_symbol("├");
+            for x in (area.x + 1)..(area.x + area.width - 1) {
+                buf[(x, sep_y)].set_symbol("─");
+            }
+            buf[(area.x + area.width - 1, sep_y)].set_symbol("┤");
+        }
 
-        // Header row
-        let header_row = area.row + 1;
-        self.print_styled(col_mark, header_row, &pad_to_cols(" ", MARK_W), STYLE_HEADER, MARK_W);
-        self.print_styled(col_name, header_row, &pad_to_cols("Name", name_width), STYLE_HEADER, name_width);
-        self.print_styled(col_size, header_row, &pad_to_cols("Size", SIZE_W), STYLE_HEADER, SIZE_W);
-        self.print_styled(col_type, header_row, &pad_to_cols("Type", TYPE_W), STYLE_HEADER, TYPE_W);
+        let visible_rows = (inner.height as usize).saturating_sub(2);
+        for (i, path) in self.files.iter().enumerate()
+            .skip(self.scroll_offset)
+            .take(visible_rows)
+        {
+            let y = inner.y + 2 + (i - self.scroll_offset) as u16;
+            if y >= area.bottom() - 1 { break; }
 
-        // Separator between header and content
-        self.goto(area.col, area.row + 2);
-        self.apply_style(Style::new());
-        self.write_raw(ML);
-        for _ in 0..inner_width { self.write_raw(H); }
-        self.write_raw(MR);
-        self.reset_style();
+            let is_cursor = i == self.cursor;
+            let is_marked = self.marked == Some(i);
 
-        // Content rows
-        let visible_rows = area.height.saturating_sub(4) as usize;
-
-        for (index, path) in files.iter().enumerate().skip(scroll_offset).take(visible_rows) {
-            let screen_row = area.row + 3 + (index - scroll_offset) as u16;
-            let is_cursor = index == cursor;
-            let is_marked = marked == Some(index);
-
-            let name = file_name_str(path);
-            let size_text = if path.is_dir() {
-                pad_to_cols(" —", SIZE_W)
+            let mark = if is_marked { "> " } else { "  " };
+            let mark_style = if is_marked {
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
-                pad_to_cols(&format_size(path), SIZE_W)
+                Style::new()
             };
-            let type_text = pad_to_cols(file_type_str(path), TYPE_W);
+            buf.set_span(inner.x, y, &Span::styled(mark, mark_style), MARK_W as u16);
 
-            // Mark cell
-            let mark_text  = if is_marked { "> " } else { "  " };
-            let mark_style = if is_marked { STYLE_MARKED } else { Style::new() };
-            self.print_styled(col_mark, screen_row, mark_text, mark_style, MARK_W);
+            let name     = file_name(path);
+            let size_str = if path.is_dir() { pad(" —", SIZE_W) } else { pad(&fmt_size(path), SIZE_W) };
+            let type_str = pad(file_type(path), TYPE_W);
+            let name_col = inner.x + MARK_W as u16 + 1;
 
             if is_cursor {
-                let row_text = format!(
-                    "{} {} {}",
-                    pad_to_cols(&name, name_width),
-                    size_text,
-                    type_text,
-                );
-                self.print_styled(col_name, screen_row, &row_text,
-                    STYLE_SELECTED, name_width + 1 + SIZE_W + 1 + TYPE_W);
+                let full = format!("{} {} {}", pad(&name, name_w), size_str, type_str);
+                let span = Span::styled(full, Style::new().add_modifier(Modifier::REVERSED));
+                buf.set_span(name_col, y, &span, (name_w + 1 + SIZE_W + 1 + TYPE_W) as u16);
             } else {
-                let name_style = if path.is_dir() { STYLE_DIR } else { Style::new() };
-                self.print_styled(col_name, screen_row,
-                    &pad_to_cols(&name, name_width), name_style, name_width);
-                self.print_styled(col_size, screen_row, &size_text, STYLE_DIM, SIZE_W);
-                self.print_styled(col_type, screen_row, &type_text, STYLE_DIM, TYPE_W);
+                let name_style = if path.is_dir() {
+                    Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+                let dim = Style::new().fg(Color::DarkGray);
+                buf.set_span(name_col,                        y, &Span::styled(pad(&name, name_w), name_style), name_w as u16);
+                buf.set_span(name_col + name_w as u16 + 1,   y, &Span::styled(size_str, dim),                  SIZE_W as u16);
+                buf.set_span(name_col + name_w as u16 + 2 + SIZE_W as u16, y, &Span::styled(type_str, dim),    TYPE_W as u16);
             }
         }
     }
+}
 
-    fn draw_border(&mut self, area: Rect, title: &str) {
-        if area.width < 2 || area.height < 2 { 
-            return; 
-        }
-        let inner_width = area.inner_width();
+#[allow(clippy::too_many_arguments)]
+fn render_columns(
+    buf: &mut Buffer,
+    x: u16, y: u16, 
+    name_w: usize,
+    mark: &str, 
+    name: &str, 
+    size: &str, 
+    typ: &str, 
+    style: Style)
+{
+    let name_col = x + MARK_W as u16 + 1;
+    buf.set_span(x,                                         y, &Span::styled(pad(mark, MARK_W), style), MARK_W as u16);
+    buf.set_span(name_col,                                  y, &Span::styled(pad(name, name_w), style), name_w as u16);
+    buf.set_span(name_col + name_w as u16 + 1,             y, &Span::styled(pad(size, SIZE_W), style), SIZE_W as u16);
+    buf.set_span(name_col + name_w as u16 + SIZE_W as u16 + 2, y, &Span::styled(pad(typ, TYPE_W), style), TYPE_W as u16);
+}
 
-        self.apply_style(Style::new());
+fn pad(s: &str, w: usize) -> String {
+    let s = truncate(s, w);
+    let len: usize = s.chars().map(char_width).sum();
+    let mut out = s.to_owned();
+    for _ in len..w { out.push(' '); }
+    out
+}
 
-        // Top edge with title
-        self.goto(area.col, area.row);
-        self.write_raw(TL);
-        let label = truncate_to_cols(title, inner_width);
-        let label_width: usize = label.chars().map(crate::ui::screen::char_width).sum();
-        self.write_raw(label);
-        for _ in 0..inner_width.saturating_sub(label_width) { self.write_raw(H); }
-        self.write_raw(TR);
-
-        // Side edges
-        for row in (area.row + 1)..(area.row + area.height - 1) {
-            self.goto(area.col, row);                 
-            self.write_raw(V);
-            self.goto(area.col + area.width - 1, row); 
-            self.write_raw(V);
-        }
-
-        // Bottom edge
-        self.goto(area.col, area.row + area.height - 1);
-        self.write_raw(BL);
-        for _ in 0..inner_width { self.write_raw(H); }
-        self.write_raw(BR);
-
-        self.reset_style();
+fn truncate(s: &str, max: usize) -> &str {
+    let mut cols = 0;
+    let mut idx  = 0;
+    for ch in s.chars() {
+        let w = char_width(ch);
+        if cols + w > max { break; }
+        cols += w;
+        idx  += ch.len_utf8();
     }
+    &s[..idx]
 }
 
-fn file_name_str(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+fn char_width(ch: char) -> usize {
+    if matches!(ch, '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{303E}' |
+        '\u{3041}'..='\u{33FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{AC00}'..='\u{D7AF}' |
+        '\u{F900}'..='\u{FAFF}' | '\u{FF01}'..='\u{FF60}' | '\u{1F004}'..='\u{1F9FF}'
+    ) { 2 } else { 1 }
 }
 
-fn format_size(path: &Path) -> String {
-    let bytes = match path.metadata() {
-        Ok(m)  => m.len(),
-        Err(_) => return "?".to_string(),
-    };
-    if bytes < 1_024 {
-        format!("{:<5}B", bytes)
-    } else if bytes < 1_024 * 1_024 {
-        format!("{:<5.1}K", bytes as f64 / 1_024.0)
-    } else if bytes < 1_024 * 1_024 * 1_024 {
-        format!("{:<5.1}M", bytes as f64 / (1_024.0 * 1_024.0))
-    } else {
-        format!("{:<5.1}G", bytes as f64 / (1_024.0 * 1_024.0 * 1_024.0))
-    }
+fn file_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-fn file_type_str(path: &Path) -> &'static str {
+fn fmt_size(path: &Path) -> String {
+    let bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+    if bytes < 1_024            { format!("{:<5}B", bytes) }
+    else if bytes < 1_024*1_024 { format!("{:<5.1}K", bytes as f64 / 1_024.0) }
+    else if bytes < 1_024*1_024*1_024 { format!("{:<5.1}M", bytes as f64 / 1_048_576.0) }
+    else                        { format!("{:<5.1}G", bytes as f64 / 1_073_741_824.0) }
+}
+
+fn file_type(path: &Path) -> &'static str {
     use std::os::unix::fs::FileTypeExt;
     match path.symlink_metadata() {
         Err(_) => "ERR",
@@ -166,5 +156,43 @@ fn file_type_str(path: &Path) -> &'static str {
             else if ft.is_socket()       { "SOCK" }
             else                         { "FILE" }
         }
+    }
+}
+
+pub fn render_border(area: Rect, title: &str, border_color: Color, buf: &mut Buffer) -> Rect {
+    let style = Style::new().fg(border_color);
+    let w = area.width;
+    let h = area.height;
+
+    buf[(area.x, area.y)].set_symbol("┌").set_style(style);
+    for x in (area.x + 1)..(area.x + w - 1) {
+        buf[(x, area.y)].set_symbol("─").set_style(style);
+    }
+    buf[(area.x + w - 1, area.y)].set_symbol("┐").set_style(style);
+
+    let title_chars: Vec<char> = title.chars().collect();
+    let max_title = (w as usize).saturating_sub(2);
+    for (i, ch) in title_chars.iter().take(max_title).enumerate() {
+        buf[(area.x + 1 + i as u16, area.y)]
+            .set_char(*ch)
+            .set_style(style);
+    }
+
+    for y in (area.y + 1)..(area.y + h - 1) {
+        buf[(area.x,         y)].set_symbol("│").set_style(style);
+        buf[(area.x + w - 1, y)].set_symbol("│").set_style(style);
+    }
+
+    buf[(area.x, area.y + h - 1)].set_symbol("└").set_style(style);
+    for x in (area.x + 1)..(area.x + w - 1) {
+        buf[(x, area.y + h - 1)].set_symbol("─").set_style(style);
+    }
+    buf[(area.x + w - 1, area.y + h - 1)].set_symbol("┘").set_style(style);
+
+    Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width:  w.saturating_sub(2),
+        height: h.saturating_sub(2),
     }
 }

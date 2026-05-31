@@ -1,115 +1,102 @@
-use crate::ui::screen::{Color, Screen, Style, pad_to_cols};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::Span,
+    widgets::Widget,
+};
+use super::file_list::render_border;
 
-const STYLE_BORDER: Style = Style::new().fg(Color::Red).bold();
-const STYLE_FILENAME: Style = Style::new().fg(Color::Yellow).bold();
-const STYLE_TOGGLE_ON: Style = Style::new().fg(Color::Cyan).bold();
-const STYLE_TOGGLE_OFF: Style = Style::new().fg(Color::DarkGray);
-const STYLE_OPTION: Style = Style::new().fg(Color::Gray);
-const STYLE_OPTION_SEL: Style = Style::new().fg(Color::White).bold().reverse();
-const STYLE_INPUT: Style = Style::new().fg(Color::White).bold();
-const STYLE_HINT: Style = Style::new().fg(Color::DarkGray);
+pub struct ConflictDialog<'a> {
+    pub filename:     &'a str,
+    pub options:      &'a [&'a str],
+    pub cursor:       usize,
+    pub apply_to_all: bool,
+    pub rename_input: Option<&'a str>,
+}
 
-const TL: &str = "┌"; const TR: &str = "┐";
-const BL: &str = "└"; const BR: &str = "┘";
-const H:  &str = "─"; const V:  &str = "│";
+impl Widget for ConflictDialog<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let body_rows = if self.rename_input.is_some() { 1u16 } else { self.options.len() as u16 };
+        let h = (6 + body_rows).min(area.height.saturating_sub(2));
+        let w = 54u16.min(area.width.saturating_sub(4));
+        let x = (area.width.saturating_sub(w)) / 2 + area.x;
+        let y = (area.height.saturating_sub(h)) / 2 + area.y;
+        let dialog = Rect { x, y, width: w, height: h };
 
-impl Screen {
-    pub fn render_conflict_dialog(
-        &mut self,
-        filename: &str,
-        options: &[&str],
-        cursor: usize,
-        apply_to_all: bool,
-        rename_input: Option<&str>,
-    ) {
-        let body_rows = if rename_input.is_some() { 1u16 } else { options.len() as u16 };
-        let dialog_h = (6 + body_rows).min(self.rows.saturating_sub(2));
-        let dialog_w = 54u16.min(self.cols.saturating_sub(4));
-        let col = (self.cols.saturating_sub(dialog_w)) / 2 + 1;
-        let row = (self.rows.saturating_sub(dialog_h)) / 2 + 1;
-        let inner_width = dialog_w.saturating_sub(2) as usize;
-
-        let blank = " ".repeat(dialog_w as usize);
-        for r in row..row + dialog_h {
-            self.print(col, r, &blank, dialog_w as usize);
+        for row in y..y + h {
+            for col in x..x + w {
+                buf[(col, row)].set_char(' ').set_style(Style::new());
+            }
         }
 
-        self.draw_dialog_border(col, row, dialog_w, dialog_h, " Conflict ");
+        let inner = render_border(dialog, " Conflict ", Color::Red, buf);
+        for x in dialog.x..dialog.x + w {
+            buf[(x, dialog.y)].set_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD));
+        }
 
-        let mut current_row = row + 1;
+        let inner_w = inner.width as usize;
+        let mut row = inner.y;
 
-        self.print(col + 1, current_row, "  ", 2);
-        let name_max = inner_width.saturating_sub(18);
-        self.print_styled(col + 3, current_row, filename, STYLE_FILENAME, name_max);
-        let name_display_len = filename.len().min(name_max);
-        self.print(col + 3 + name_display_len as u16, current_row,
-            " already exists", inner_width.saturating_sub(name_display_len + 2));
-        current_row += 2; // filename + blank
+        let name_max = inner_w.saturating_sub(16);
+        let name = truncate(self.filename, name_max);
+        buf.set_span(inner.x + 2, row,
+            &Span::styled(name, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            name_max as u16);
+        buf.set_span(inner.x + 2 + name_max as u16, row,
+            &Span::raw(" already exists"),
+            inner.width.saturating_sub(name_max as u16 + 2));
+        row += 2;
 
-        if let Some(input_text) = rename_input {
-            let prompt = format!("  Rename to: {}_", input_text);
-            self.print_styled(col + 1, current_row,
-                &pad_to_cols(&prompt, inner_width), STYLE_INPUT, inner_width);
+        if let Some(input) = self.rename_input {
+            let prompt = format!("  Rename to: {}_", input);
+            buf.set_span(inner.x, row,
+                &Span::styled(pad(&prompt, inner_w), Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
+                inner.width);
         } else {
-            let (toggle_str, toggle_style) = if apply_to_all {
-                ("[*] Apply to all", STYLE_TOGGLE_ON)
+            let (toggle, t_style) = if self.apply_to_all {
+                ("[*] Apply to all", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             } else {
-                ("[ ] Apply to all", STYLE_TOGGLE_OFF)
+                ("[ ] Apply to all", Style::new().fg(Color::DarkGray))
             };
-            self.print_styled(col + 1, current_row,
-                &format!("  {}", toggle_str), toggle_style,
-                inner_width.saturating_sub(2));
+            buf.set_span(inner.x + 2, row, &Span::styled(toggle, t_style), toggle.len() as u16);
             let hint = "(a / space)";
-            let hint_col = col + 1 + (inner_width.saturating_sub(hint.len())) as u16;
-            self.print_styled(hint_col, current_row, hint, STYLE_HINT, hint.len());
-            current_row += 2; // toggle + blank
+            let hint_x = inner.x + inner.width.saturating_sub(hint.len() as u16);
+            buf.set_span(hint_x, row, &Span::styled(hint, Style::new().fg(Color::DarkGray)), hint.len() as u16);
+            row += 2;
 
-            for (index, label) in options.iter().enumerate() {
-                if current_row >= row + dialog_h - 1 { break; }
-                let is_selected = index == cursor;
-                let marker      = if is_selected { "> " } else { "  " };
-                let style       = if is_selected { STYLE_OPTION_SEL } else { STYLE_OPTION };
-                self.print_styled(col + 1, current_row,
-                    &pad_to_cols(&format!("  {}{}", marker, label), inner_width),
-                    style, inner_width);
-                current_row += 1;
+            for (i, label) in self.options.iter().enumerate() {
+                if row >= dialog.y + h - 1 { break; }
+                let selected = i == self.cursor;
+                let marker = if selected { "> " } else { "  " };
+                let text   = pad(&format!("  {}{}", marker, label), inner_w);
+                let style  = if selected {
+                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::new().fg(Color::Gray)
+                };
+                buf.set_span(inner.x, row, &Span::styled(text, style), inner.width);
+                row += 1;
             }
         }
     }
+}
 
-    fn draw_dialog_border(&mut self, col: u16, row: u16, width: u16, height: u16, title: &str) {
-        let inner_width = width.saturating_sub(2) as usize;
-        self.apply_style(STYLE_BORDER);
+fn pad(s: &str, w: usize) -> String {
+    let trunc = truncate(s, w);
+    let mut out = trunc.to_owned();
+    while out.len() < w { out.push(' '); }
+    out
+}
 
-        self.goto(col, row);
-        self.write_raw(TL);
-        let title_len = title.len().min(inner_width);
-        let padding_left = (inner_width.saturating_sub(title_len)) / 2;
-        let padding_right = inner_width.saturating_sub(title_len + padding_left);
-        for _ in 0..padding_left  { 
-            self.write_raw(H); 
-        }
-        self.write_raw(&title[..title_len]);
-        for _ in 0..padding_right { 
-            self.write_raw(H); 
-        }
-        self.write_raw(TR);
-
-        for r in (row + 1)..(row + height - 1) {
-            self.goto(col, r); 
-            self.write_raw(V);
-            
-            self.goto(col + width - 1, r); 
-            self.write_raw(V);
-        }
-
-        self.goto(col, row + height - 1);
-        self.write_raw(BL);
-        for _ in 0..inner_width { 
-            self.write_raw(H); 
-        }
-        self.write_raw(BR);
-
-        self.reset_style();
+fn truncate(s: &str, max: usize) -> &str {
+    let mut idx = 0;
+    let mut cols = 0;
+    for ch in s.chars() {
+        let cw = if matches!(ch, '\u{1100}'..='\u{115F}' | '\u{4E00}'..='\u{9FFF}') { 2 } else { 1 };
+        if cols + cw > max { break; }
+        cols += cw;
+        idx  += ch.len_utf8();
     }
+    &s[..idx]
 }

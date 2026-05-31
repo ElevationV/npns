@@ -1,77 +1,86 @@
-use crate::ui::screen::{Color, Rect, Screen, Style, pad_to_cols, wrap_lines};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::Span,
+    widgets::Widget,
+};
+use super::file_list::render_border;
 
-const STYLE_CONTENT: Style = Style::new().fg(Color::Gray);
-const STYLE_BORDER: Style = Style::new().fg(Color::DarkGray);
-const STYLE_BORDER_DIR: Style = Style::new().fg(Color::Blue);
-const STYLE_DIR_ENTRY: Style = Style::new().fg(Color::Blue).bold();
+pub struct Preview<'a> {
+    pub title:   &'a str,
+    pub content: &'a str,
+}
 
-const TL: &str = "┌"; const TR: &str = "┐";
-const BL: &str = "└"; const BR: &str = "┘";
-const H:  &str = "─"; const V:  &str = "│";
-
-impl Screen {
-    pub fn render_preview(
-        &mut self,
-        area:    Rect,
-        title:   &str,
-        content: &str,
-    ) {
+impl Widget for Preview<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 3 || area.height < 3 { return; }
-        let is_dir_listing = !content.is_empty()
-            && content.lines().all(|l| l.starts_with("> ") || l.starts_with("  "));
-        let border_style = if is_dir_listing { STYLE_BORDER_DIR } else { STYLE_BORDER };
 
-        self.draw_preview_border(area, title, border_style);
+        let is_dir = !self.content.is_empty()
+            && self.content.lines().all(|l| l.starts_with("> ") || l.starts_with("  "));
+        let border_color = if is_dir { Color::Blue } else { Color::DarkGray };
 
-        let inner_width  = area.inner_width();
-        let inner_height = area.inner_height();
-        let lines        = wrap_lines(content, inner_width);
+        let inner = render_border(area, self.title, border_color, buf);
+        let w = inner.width as usize;
 
-        for i in 0..inner_height {
-            let screen_row = area.row + 1 + i as u16;
-            match lines.get(i) {
-                None => {
-                    // Blank padding row
-                    self.print(area.col + 1, screen_row, &" ".repeat(inner_width), inner_width);
-                }
-                Some(line) => {
-                    let style = if line.starts_with("> ") {
-                        STYLE_DIR_ENTRY
-                    } else {
-                        STYLE_CONTENT
-                    };
-                    self.print_styled(area.col + 1, screen_row,
-                        &pad_to_cols(line, inner_width), style, inner_width);
-                }
+        for (i, line) in wrap(self.content, w)
+            .iter()
+            .enumerate()
+            .take(inner.height as usize)
+        {
+            let y = inner.y + i as u16;
+            let style = if line.starts_with("> ") {
+                Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            buf.set_span(inner.x, y, &Span::styled(pad(line, w), style), inner.width);
+        }
+    }
+}
+
+fn pad(s: &str, w: usize) -> String {
+    let trunc = truncate(s, w);
+    let len: usize = trunc.chars().map(char_w).sum();
+    let mut out = trunc.to_owned();
+    for _ in len..w { out.push(' '); }
+    out
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    let mut cols = 0;
+    let mut idx  = 0;
+    for ch in s.chars() {
+        let w = char_w(ch);
+        if cols + w > max { break; }
+        cols += w;
+        idx  += ch.len_utf8();
+    }
+    &s[..idx]
+}
+
+fn wrap(text: &str, max_w: usize) -> Vec<String> {
+    if max_w == 0 { return vec![]; }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() { out.push(String::new()); continue; }
+        let mut rem = line;
+        while !rem.is_empty() {
+            let chunk = truncate(rem, max_w);
+            if chunk.is_empty() {
+                rem = &rem[rem.chars().next().map(|c| c.len_utf8()).unwrap_or(1)..];
+            } else {
+                out.push(chunk.to_owned());
+                rem = &rem[chunk.len()..];
             }
         }
     }
+    out
+}
 
-    fn draw_preview_border(&mut self, area: Rect, title: &str, style: Style) {
-        use crate::ui::screen::{char_width, truncate_to_cols};
-        if area.width < 2 || area.height < 2 { return; }
-        let inner_width = area.inner_width();
-
-        self.apply_style(style);
-
-        self.goto(area.col, area.row);
-        self.write_raw(TL);
-        let label       = truncate_to_cols(title, inner_width);
-        let label_width: usize = label.chars().map(char_width).sum();
-        self.write_raw(label);
-        for _ in 0..inner_width.saturating_sub(label_width) { self.write_raw(H); }
-        self.write_raw(TR);
-
-        for row in (area.row + 1)..(area.row + area.height - 1) {
-            self.goto(area.col, row);                  self.write_raw(V);
-            self.goto(area.col + area.width - 1, row); self.write_raw(V);
-        }
-
-        self.goto(area.col, area.row + area.height - 1);
-        self.write_raw(BL);
-        for _ in 0..inner_width { self.write_raw(H); }
-        self.write_raw(BR);
-
-        self.reset_style();
-    }
+fn char_w(ch: char) -> usize {
+    if matches!(ch, '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{303E}' |
+        '\u{3041}'..='\u{33FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{AC00}'..='\u{D7AF}' |
+        '\u{F900}'..='\u{FAFF}' | '\u{FF01}'..='\u{FF60}' | '\u{1F004}'..='\u{1F9FF}'
+    ) { 2 } else { 1 }
 }

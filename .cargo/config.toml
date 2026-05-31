@@ -1,5 +1,5 @@
-[target.armv7-unknown-linux-musleabihf]
-linker = "armv7l-linux-gnueabihf-gcc"
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
 rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "target-cpu=cortex-a7",
@@ -7,9 +7,20 @@ rustflags = [
     "-Cpanic=immediate-abort"
 ]
 
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "target-cpu=cortex-a53",
+    "-Zunstable-options",
+    "-Cpanic=immediate-abort"
+]
+
 [env]
 CC_armv7_unknown_linux_musleabihf = "armv7l-linux-gnueabihf-gcc"
 AR_armv7_unknown_linux_musleabihf = "armv7l-linux-gnueabihf-ar"
+CC_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-gcc"
+AR_aarch64_unknown_linux_gnu = "aarch64-linux-gnu-ar"
 
 [unstable]
 build-std = ["std", "panic_abort"]
