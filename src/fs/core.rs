@@ -11,7 +11,7 @@ use crate::{
 use crate::fs::{
     clipboard::Clipboard,
     duplicate_handler::{DuplicatedFileHandleOps, PasteAbort, ApplyToAll, FileConflictResult, DirConflictResult},
-    file_list::FileList,
+    file_list::{FileEntry, FileList},
     history::History,
     operations::{OperationFS, OperationUnitFS},
     state::{FileSysState, StateFlag},
@@ -55,6 +55,10 @@ impl FileSystemCore {
     }
 
     pub fn new_file(&mut self, name: &str, is_dir: bool) {
+        if !is_valid_filename(name) {
+            self.set_state(Error, format!("Invalid filename: {name}"));
+            return;
+        }
         let destiny_path = self.here().join(name);
         if destiny_path.exists() {
             self.set_state(Error, format!("{name} already exists"));
@@ -85,14 +89,11 @@ impl FileSystemCore {
     where
         F: Fn(&PathBuf, bool) -> (DuplicatedFileHandleOps, bool),
     {
-        // set state
         self.set_operating_state("Pasting");
-        // source path and operation
         let (source, is_copy) =
             check_or_return!(self, "Get From Clipboard", self.get_clipboard()).clone();
-        // destiny dir
         let destiny_dir = self.here();
-        
+
         if source.is_dir() {
             self.paste_dir(&source, &destiny_dir, is_copy, &handle_duplicate);
         } else {
@@ -103,6 +104,10 @@ impl FileSystemCore {
     }
 
     pub fn rename_selected(&mut self, new_name: &str) {
+        if !is_valid_filename(new_name) {
+            self.set_state(Error, format!("Invalid filename: {new_name}"));
+            return;
+        }
         let file = check_or_return!(self, "Rename", self.get_selected_file_info());
         let old_path = file.clone();
         let new_path = check_or_return!(self, "Rename", rename_file_name(&old_path, new_name));
@@ -234,12 +239,15 @@ impl FileSystemCore {
         self.set_state(Ready, "Undone");
     }
     
-    pub fn remove_selected(&mut self) { 
+    pub fn remove_selected(&mut self) {
         let file = check_or_return!(self, "Remove", self.get_selected_file_info());
-        check_or_return!(self, "Remove", remove_file(file, file.is_dir()));
+        let is_dir = file.is_dir();
+        let file = file.clone();
+        check_or_return!(self, "Remove", remove_file(&file, is_dir));
+        self.refresh();
     }
 
-    pub fn files(&self) -> &[PathBuf] { self.file_list.files() }
+    pub fn entries(&self) -> &[FileEntry] { self.file_list.entries() }
     pub fn get_file(&self, index: usize) -> Option<&PathBuf> { self.file_list.get(index) }
     pub fn current_dir(&self) -> &PathBuf { &self.current_dir }
     pub fn state_flag(&self) -> StateFlag { self.state.flag() }
@@ -261,10 +269,10 @@ impl FileSystemCore {
     fn get_clipboard(&self) -> Result<&(PathBuf, bool), String> {
         self.clipboard.get().ok_or_else(|| "Clipboard is empty".to_string())
     }
-    fn remove_by_name(&mut self, name: &PathBuf) -> Result<(), io::Error> {
+    fn remove_by_name(&mut self, name: &Path) -> Result<(), io::Error> {
         let is_dir = name.is_dir();
         if self.history_is_available() {
-            self.push_history(OperationFS::Remove, name.clone(), PathBuf::new());
+            self.push_history(OperationFS::Remove, name.to_path_buf(), PathBuf::new());
         }
         remove_file(name, is_dir)
     }
@@ -283,24 +291,20 @@ impl FileSystemCore {
 
 // Paste helpers
 impl FileSystemCore {
-    // Paste a single file.  Calls handle_file_duplicate for conflict resolution
     fn paste_file<F>(
         &mut self,
-        source:      &PathBuf,
+        source:      &Path,
         destiny_dir: &Path,
         is_copy:     bool,
         callback:    &F,
     ) where
         F: Fn(&PathBuf, bool) -> (DuplicatedFileHandleOps, bool),
     {
-        // get source file name
         let file_name = check_or_return!(
             self, "Get File Name",
             source.file_name().ok_or("source path has no file name")
         );
-        // construct 'initial' destiny path(will handle duplicate later)
         let initial = destiny_dir.join(file_name);
-        // resolve file conflicts
         let (final_dest, handler) = match handle_file_duplicate(initial, callback) {
             FileConflictResult::Cancel => {
                 self.set_state(Ready, "Cancelled");
@@ -313,7 +317,6 @@ impl FileSystemCore {
             FileConflictResult::Proceed { dest, handler, .. } => (dest, handler),
         };
 
-        // For Overwrite: delete the existing file first (recorded in history)
         if matches!(handler, DuplicatedFileHandleOps::Overwrite) {
             check_or_return!(self, "Overwrite File", self.remove_by_name(&final_dest));
         }
@@ -326,22 +329,13 @@ impl FileSystemCore {
             OperationFS::Move
         };
 
-        self.push_history(operation, source.clone(), final_dest);
+        self.push_history(operation, source.to_path_buf(), final_dest);
         self.set_state(Ready, "Done");
     }
 
-    /// # Paste a directory
-    ///
-    /// Handles:
-    ///   - Top-level conflict resolution (one call to handle_dir_duplicate)
-    ///   - History StartRange / EndRange wrapping
-    ///   - Rollback on failure
-    ///   - Source removal on successful move
-    ///
-    /// Does NOT perform single file operations
     fn paste_dir<F>(
         &mut self,
-        source:      &PathBuf,
+        source:      &Path,
         destiny_dir: &Path,
         is_copy:     bool,
         callback:    &F,
@@ -374,9 +368,9 @@ impl FileSystemCore {
         if self.history_is_available() {
             self.push_history(OperationFS::StartRange, PathBuf::new(), PathBuf::new());
             if is_copy {
-                self.push_history(OperationFS::Copy, source.clone(), destiny_root.clone());
+                self.push_history(OperationFS::Copy, source.to_path_buf(), destiny_root.clone());
             } else {
-                self.push_history(OperationFS::Move, source.clone(), destiny_root.clone());
+                self.push_history(OperationFS::Move, source.to_path_buf(), destiny_root.clone());
             }
         }
 
@@ -398,17 +392,11 @@ impl FileSystemCore {
         }
     }
 
-    /// # Recursive copy/move of directory contents
-    ///
-    /// __THE ONLY FUNCTION__ that calls the callback (via `handle_file_duplicate` and `handle_dir_duplicate`)
-    ///
-    /// Maintains ApplyToAll across the loop.  
-    /// ApplyToAll is local to this call frame; 
-    /// sub-directories get their own frame and therefore their own independent ApplyToAll state, 
-    /// which is correct: apply-to-all means "all items at this level" not "all items in the entire tree"
+    // ApplyToAll is local to this call frame; sub-directories get their own frame,
+    // so "apply to all" means items at this level only, not the entire tree.
     fn pasting_dir<F>(
         &mut self,
-        source:   &PathBuf,
+        source:   &Path,
         destiny:  &Path,
         is_copy:  bool,
         callback: &F,
@@ -442,10 +430,9 @@ impl FileSystemCore {
         Ok(())
     }
 
-    /// Process one file entry inside pasting_dir.
     fn process_file_entry<F>(
         &mut self,
-        source:       &PathBuf,
+        source:       &Path,
         destiny:      PathBuf,
         is_copy:      bool,
         apply_to_all: &mut ApplyToAll,
@@ -454,15 +441,11 @@ impl FileSystemCore {
     where
         F: Fn(&PathBuf, bool) -> (DuplicatedFileHandleOps, bool),
     {
-        // Determine (final destination, handler).
         let (final_dest, handler, apply) = if !destiny.exists() {
-            // No conflict — proceed directly.
             (destiny, DuplicatedFileHandleOps::None, false)
         } else if let Some(stored) = apply_to_all.get(false) {
-            // apply-to-all active for files — use stored handler.
             (destiny, stored.clone(), true)
         } else {
-            // Ask the user.
             match handle_file_duplicate(destiny, callback) {
                 FileConflictResult::Cancel => return Err(PasteAbort::Cancel),
                 FileConflictResult::Skip { apply } => {
@@ -473,20 +456,17 @@ impl FileSystemCore {
             }
         };
 
-        // Update apply_to_all from this interaction.
         apply_to_all.update(&handler, apply, false);
 
-        // For Overwrite: remove the existing target first.
         if matches!(handler, DuplicatedFileHandleOps::Overwrite) {
             check_or_abort_paste!(self, "Overwrite File", self.remove_by_name(&final_dest));
         }
 
-        // Execute copy or move.
         if is_copy {
             check_or_abort_paste!(self, "Copy File", fs::copy(source, &final_dest));
             // Record copy so undo can delete the destination file.
             if self.history_is_available() {
-                self.push_history(OperationFS::Copy, source.clone(), final_dest.clone());
+                self.push_history(OperationFS::Copy, source.to_path_buf(), final_dest.clone());
             }
         } else {
             check_or_abort_paste!(self, "Move File", fs::rename(source, &final_dest));
@@ -495,10 +475,9 @@ impl FileSystemCore {
         Ok(())
     }
 
-    // Process one directory entry inside pasting_dir.
     fn process_dir_entry<F>(
         &mut self,
-        source:       &PathBuf,
+        source:       &Path,
         destiny:      PathBuf,
         is_copy:      bool,
         apply_to_all: &mut ApplyToAll,
@@ -523,20 +502,16 @@ impl FileSystemCore {
             }
         };
 
-        // Update apply_to_all from this interaction.
         apply_to_all.update(&handler, apply, true);
 
-        // Create the destination directory.
         check_or_abort_paste!(self, "Create DIR", fs::create_dir_all(&final_dest));
 
         // For copy: record New so undo can remove the created directory.
-        // For move: do NOT record — the top-level Move(src_root, dst_root)
-        // handles the entire tree rename on undo.
+        // For move: the top-level Move(src_root, dst_root) handles the entire tree on undo.
         if is_copy && self.history_is_available() {
             self.push_history(OperationFS::New, final_dest.clone(), PathBuf::new());
         }
 
-        // Recurse — sub-directory gets its own ApplyToAll frame.
         self.pasting_dir(source, &final_dest, is_copy, callback)?;
 
         if !is_copy {
@@ -562,9 +537,14 @@ fn rename_file_name(original: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(parent.join(name))
 }
 
-fn get_file_name(file: &PathBuf) -> Result<String, String> {
+fn get_file_name(file: &Path) -> Result<String, String> {
     match file.file_name() {
         Some(name) => Ok(name.to_string_lossy().into_owned()),
         None => Err(format!("Error getting file name from: {:?}", file))
     }
+}
+
+// Reject names that would escape the current directory or contain null bytes.
+fn is_valid_filename(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\0')
 }

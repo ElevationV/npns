@@ -9,4 +9,5 @@ mod state;
 
 pub use core::FileSystemCore;
 pub use duplicate_handler::DuplicatedFileHandleOps;
+pub use file_list::FileEntry;
 pub use state::StateFlag;

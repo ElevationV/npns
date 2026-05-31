@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
@@ -9,7 +7,7 @@ use std::thread;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Widget;
 
-use crate::fs::{FileSystemCore, DuplicatedFileHandleOps, StateFlag};
+use crate::fs::{FileEntry, FileSystemCore, DuplicatedFileHandleOps, StateFlag};
 use crate::ui::input::{read_key, read_key_timeout, KeyCode};
 use crate::ui::tui::Tui;
 use crate::ui::widget::{
@@ -63,7 +61,7 @@ impl PasteDialog {
 
 pub struct App {
     fs:            FileSystemCore,
-    view:          Vec<PathBuf>,
+    view:          Vec<FileEntry>,
     list_pos:      usize,
     scroll_offset: usize,
     marked:        Option<usize>,
@@ -100,13 +98,21 @@ impl App {
     }
 
     pub fn run(&mut self, tui: &mut Tui) -> Result<()> {
+        let mut needs_redraw = true;
         loop {
-            self.poll_preview();
-            tui.draw(|frame| self.render(frame.area(), frame.buffer_mut()))?;
+            if self.poll_preview() { needs_redraw = true; }
+
+            if needs_redraw {
+                tui.draw(|frame| self.render(frame.area(), frame.buffer_mut()))?;
+                needs_redraw = false;
+            }
 
             if self.should_quit { break; }
 
-            let Some(key) = read_key_timeout(20)? else { continue };
+            // Block up to 500 ms; only redraw when something actually changed.
+            let Some(key) = read_key_timeout(500)? else { continue };
+            needs_redraw = true;
+
             let prev_pos = self.list_pos;
 
             if key == KeyCode::Char('v') && self.input_ctx == InputContext::None {
@@ -150,13 +156,11 @@ impl App {
 
         let marked_view = self.marked.and_then(|orig| {
             self.fs.get_file(orig)
-                .and_then(|p| self.view.iter().position(|v| v == p))
+                .and_then(|p| self.view.iter().position(|e| &e.path == p))
         });
 
-        let view_refs: Vec<&Path> = self.view.iter().map(PathBuf::as_path).collect();
-
         FileList {
-            files:         &view_refs,
+            entries:       &self.view,
             cursor:        self.list_pos,
             scroll_offset: self.scroll_offset,
             marked:        marked_view,
@@ -165,7 +169,7 @@ impl App {
 
         let preview_content = self.build_preview_content();
         let preview_title = self.view.get(self.list_pos)
-            .and_then(|p| p.file_name())
+            .and_then(|e| e.path.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Preview".to_string());
 
@@ -180,6 +184,8 @@ impl App {
     }
 
     fn run_paste(&mut self, tui: &mut Tui) -> Result<()> {
+        // paste() calls the closure synchronously and never stores it, so splitting the
+        // borrow via raw pointers is sound: both pointers remain valid for the entire call.
         let self_ptr = self as *mut App;
         let tui_ptr  = tui  as *mut Tui;
 
@@ -354,9 +360,10 @@ impl App {
     }
 
     fn enter_dir(&mut self) {
-        let Some(path) = self.view.get(self.list_pos) else { return };
-        if !path.is_dir() { return; }
-        let orig = self.view_to_orig(self.list_pos);
+        let Some(entry) = self.view.get(self.list_pos) else { return };
+        if !entry.is_dir { return; }
+        let path = entry.path.clone();
+        let orig = self.view_to_orig(&path);
         let _ = self.fs.select(orig);
         self.fs.enter_selected();
         self.search_query.clear();
@@ -365,7 +372,8 @@ impl App {
     }
 
     fn toggle_mark(&mut self) {
-        let orig = self.view_to_orig(self.list_pos);
+        let Some(entry) = self.view.get(self.list_pos) else { return };
+        let orig = self.view_to_orig(&entry.path);
         self.marked = if self.marked == Some(orig) { None } else { Some(orig) };
     }
 
@@ -388,9 +396,9 @@ impl App {
 
     fn rebuild_view(&mut self) {
         let query = self.search_query.to_lowercase();
-        self.view = self.fs.files().iter()
-            .filter(|p| {
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.view = self.fs.entries().iter()
+            .filter(|e| {
+                let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 (self.show_hidden || !name.starts_with('.'))
                 && (query.is_empty() || name.to_lowercase().contains(&query))
             })
@@ -404,9 +412,8 @@ impl App {
         self.view_dirty = true;
     }
 
-    fn view_to_orig(&self, idx: usize) -> usize {
-        let Some(path) = self.view.get(idx) else { return 0 };
-        self.fs.files().iter().position(|p| p == path).unwrap_or(0)
+    fn view_to_orig(&self, path: &Path) -> usize {
+        self.fs.entries().iter().position(|e| e.path == path).unwrap_or(0)
     }
 
     fn clamp_scroll(&mut self, terminal_rows: usize) {
@@ -419,31 +426,36 @@ impl App {
     }
 
     fn spawn_preview(&mut self) {
-        let Some(path) = self.view.get(self.list_pos)
-            .filter(|p| !p.is_dir()).cloned()
-        else { return };
+        let Some(entry) = self.view.get(self.list_pos) else { return };
+        if entry.is_dir {
+            // Dir preview is cheap enough to build inline; no thread needed.
+            self.preview_text = build_dir_preview(&entry.path, self.show_hidden);
+            return;
+        }
+        let path = entry.path.clone();
         let (tx, rx) = mpsc::channel();
         self.preview_rx = Some(rx);
         thread::spawn(move || { let _ = tx.send(read_file_preview(&path)); });
     }
 
-    fn poll_preview(&mut self) {
+    // Returns true if new preview data arrived (caller should redraw).
+    fn poll_preview(&mut self) -> bool {
         if let Some(rx) = &self.preview_rx && let Ok(text) = rx.try_recv() {
             self.preview_text = text;
             self.preview_rx   = None;
+            return true;
         }
+        false
     }
 
     fn build_preview_content(&self) -> String {
-        let Some(path) = self.view.get(self.list_pos) else {
+        let Some(entry) = self.view.get(self.list_pos) else {
             return String::new();
         };
-        if path.is_dir() {
-            return build_dir_preview(path, self.show_hidden);
+        if entry.is_dir {
+            return self.preview_text.clone();
         }
-        let size = path.symlink_metadata()
-            .map(|m| fmt_size(m.len()))
-            .unwrap_or_else(|_| "?".to_string());
+        let size = fmt_size(entry.size);
         if self.preview_text.is_empty() {
             format!("Size: {}\n\nLoading...", size)
         } else {
@@ -482,7 +494,7 @@ impl App {
         let total = self.view.len();
         let pos   = if total == 0 { 0 } else { self.list_pos + 1 };
         let perms = self.view.get(self.list_pos)
-            .and_then(|p| p.symlink_metadata().ok())
+            .and_then(|e| e.path.symlink_metadata().ok())
             .map(|m| fmt_permissions(m.permissions().mode()))
             .unwrap_or_else(|| "----------".to_string());
         format!("{}  {}/{}", perms, pos, total)

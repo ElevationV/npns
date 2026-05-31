@@ -3,9 +3,10 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Span},
+    text::Span,
     widgets::Widget,
 };
+use crate::fs::FileEntry;
 
 const MARK_W: usize = 2;
 const SIZE_W: usize = 8;
@@ -13,7 +14,7 @@ const TYPE_W: usize = 4;
 const GAPS:   usize = 3;
 
 pub struct FileList<'a> {
-    pub files:         &'a [&'a Path],
+    pub entries:       &'a [FileEntry],
     pub cursor:        usize,
     pub scroll_offset: usize,
     pub marked:        Option<usize>,
@@ -43,7 +44,7 @@ impl Widget for FileList<'_> {
         }
 
         let visible_rows = (inner.height as usize).saturating_sub(2);
-        for (i, path) in self.files.iter().enumerate()
+        for (i, entry) in self.entries.iter().enumerate()
             .skip(self.scroll_offset)
             .take(visible_rows)
         {
@@ -61,9 +62,9 @@ impl Widget for FileList<'_> {
             };
             buf.set_span(inner.x, y, &Span::styled(mark, mark_style), MARK_W as u16);
 
-            let name     = file_name(path);
-            let size_str = if path.is_dir() { pad(" —", SIZE_W) } else { pad(&fmt_size(path), SIZE_W) };
-            let type_str = pad(file_type(path), TYPE_W);
+            let name     = file_name(&entry.path);
+            let size_str = if entry.is_dir { pad(" —", SIZE_W) } else { pad(&fmt_size(entry.size), SIZE_W) };
+            let type_str = pad(entry.kind.as_str(), TYPE_W);
             let name_col = inner.x + MARK_W as u16 + 1;
 
             if is_cursor {
@@ -71,7 +72,7 @@ impl Widget for FileList<'_> {
                 let span = Span::styled(full, Style::new().add_modifier(Modifier::REVERSED));
                 buf.set_span(name_col, y, &span, (name_w + 1 + SIZE_W + 1 + TYPE_W) as u16);
             } else {
-                let name_style = if path.is_dir() {
+                let name_style = if entry.is_dir {
                     Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
                 } else {
                     Style::new()
@@ -88,12 +89,12 @@ impl Widget for FileList<'_> {
 #[allow(clippy::too_many_arguments)]
 fn render_columns(
     buf: &mut Buffer,
-    x: u16, y: u16, 
+    x: u16, y: u16,
     name_w: usize,
-    mark: &str, 
-    name: &str, 
-    size: &str, 
-    typ: &str, 
+    mark: &str,
+    name: &str,
+    size: &str,
+    typ: &str,
     style: Style)
 {
     let name_col = x + MARK_W as u16 + 1;
@@ -103,7 +104,7 @@ fn render_columns(
     buf.set_span(name_col + name_w as u16 + SIZE_W as u16 + 2, y, &Span::styled(pad(typ, TYPE_W), style), TYPE_W as u16);
 }
 
-fn pad(s: &str, w: usize) -> String {
+pub fn pad(s: &str, w: usize) -> String {
     let s = truncate(s, w);
     let len: usize = s.chars().map(char_width).sum();
     let mut out = s.to_owned();
@@ -111,7 +112,7 @@ fn pad(s: &str, w: usize) -> String {
     out
 }
 
-fn truncate(s: &str, max: usize) -> &str {
+pub fn truncate(s: &str, max: usize) -> &str {
     let mut cols = 0;
     let mut idx  = 0;
     for ch in s.chars() {
@@ -123,8 +124,9 @@ fn truncate(s: &str, max: usize) -> &str {
     &s[..idx]
 }
 
-fn char_width(ch: char) -> usize {
-    if matches!(ch, '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{303E}' |
+pub fn char_width(ch: char) -> usize {
+    if matches!(ch,
+        '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{303E}' |
         '\u{3041}'..='\u{33FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{AC00}'..='\u{D7AF}' |
         '\u{F900}'..='\u{FAFF}' | '\u{FF01}'..='\u{FF60}' | '\u{1F004}'..='\u{1F9FF}'
     ) { 2 } else { 1 }
@@ -134,29 +136,11 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-fn fmt_size(path: &Path) -> String {
-    let bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+fn fmt_size(bytes: u64) -> String {
     if bytes < 1_024            { format!("{:<5}B", bytes) }
     else if bytes < 1_024*1_024 { format!("{:<5.1}K", bytes as f64 / 1_024.0) }
     else if bytes < 1_024*1_024*1_024 { format!("{:<5.1}M", bytes as f64 / 1_048_576.0) }
     else                        { format!("{:<5.1}G", bytes as f64 / 1_073_741_824.0) }
-}
-
-fn file_type(path: &Path) -> &'static str {
-    use std::os::unix::fs::FileTypeExt;
-    match path.symlink_metadata() {
-        Err(_) => "ERR",
-        Ok(m)  => {
-            let ft = m.file_type();
-            if      ft.is_dir()          { "DIR"  }
-            else if ft.is_symlink()      { "LINK" }
-            else if ft.is_fifo()         { "FIFO" }
-            else if ft.is_char_device()  { "CHAR" }
-            else if ft.is_block_device() { "BLK"  }
-            else if ft.is_socket()       { "SOCK" }
-            else                         { "FILE" }
-        }
-    }
 }
 
 pub fn render_border(area: Rect, title: &str, border_color: Color, buf: &mut Buffer) -> Rect {
