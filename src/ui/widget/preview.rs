@@ -5,7 +5,7 @@ use ratatui::{
     text::Span,
     widgets::Widget,
 };
-use super::file_list::render_border;
+use super::file_list::{render_border, pad, truncate};
 
 pub struct Preview<'a> {
     pub title:   &'a str,
@@ -39,26 +39,6 @@ impl Widget for Preview<'_> {
     }
 }
 
-fn pad(s: &str, w: usize) -> String {
-    let trunc = truncate(s, w);
-    let len: usize = trunc.chars().map(char_w).sum();
-    let mut out = trunc.to_owned();
-    for _ in len..w { out.push(' '); }
-    out
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    let mut cols = 0;
-    let mut idx  = 0;
-    for ch in s.chars() {
-        let w = char_w(ch);
-        if cols + w > max { break; }
-        cols += w;
-        idx  += ch.len_utf8();
-    }
-    &s[..idx]
-}
-
 fn wrap(text: &str, max_w: usize) -> Vec<String> {
     if max_w == 0 { return vec![]; }
     let mut out = Vec::new();
@@ -76,11 +56,4 @@ fn wrap(text: &str, max_w: usize) -> Vec<String> {
         }
     }
     out
-}
-
-fn char_w(ch: char) -> usize {
-    if matches!(ch, '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{303E}' |
-        '\u{3041}'..='\u{33FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{AC00}'..='\u{D7AF}' |
-        '\u{F900}'..='\u{FAFF}' | '\u{FF01}'..='\u{FF60}' | '\u{1F004}'..='\u{1F9FF}'
-    ) { 2 } else { 1 }
 }

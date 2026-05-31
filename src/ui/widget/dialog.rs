@@ -5,7 +5,7 @@ use ratatui::{
     text::Span,
     widgets::Widget,
 };
-use super::file_list::render_border;
+use super::file_list::{render_border, pad, truncate};
 
 pub struct ConflictDialog<'a> {
     pub filename:     &'a str,
@@ -80,23 +80,4 @@ impl Widget for ConflictDialog<'_> {
             }
         }
     }
-}
-
-fn pad(s: &str, w: usize) -> String {
-    let trunc = truncate(s, w);
-    let mut out = trunc.to_owned();
-    while out.len() < w { out.push(' '); }
-    out
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    let mut idx = 0;
-    let mut cols = 0;
-    for ch in s.chars() {
-        let cw = if matches!(ch, '\u{1100}'..='\u{115F}' | '\u{4E00}'..='\u{9FFF}') { 2 } else { 1 };
-        if cols + cw > max { break; }
-        cols += cw;
-        idx  += ch.len_utf8();
-    }
-    &s[..idx]
 }
