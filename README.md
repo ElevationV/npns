@@ -7,32 +7,48 @@ Built in Rust, it's a no-frills tool for browsing files over serial consoles or 
 ![demo](./assets/demo.png)
 
 ## Features
-  - Supports most of the file operation, like Copy, Cut, Paste
-  - could handle conflict file while pasting files
-  - couldn't undo `delete`, because Trash dir may not exist
-  - need not mouse, and arrow-key(bacause serial may unstable and truncate these keys(ANSI) into others)
-  - probably crash if there are too many fils in current directory(but who will put that mamy of files in a single diectory on their board)
-  - can work on my machine(seriously I.MX6ULL MINI)
-  - about 100-200Kib under release mode
+- Supports most of the file operation, like Copy, Cut, Paste
+- Could handle conflict files while pasting
+- Cannot undo `delete`, because Trash dir may not exist
+- No mouse required, and arrow keys work too
+- Can work on my machine (seriously, I.MX6ULL MINI and ATK-DLAM62L)
+- About 1-2 MiB under release mode (ratatui + crossterm)
 
 ## Compile
-Just compile it as how you compile other embedded rust projects. 
 
-and the given config is used for Arm-Linux. Just run the following command
+Add the target:
+```
+rustup target add aarch64-unknown-linux-musl
+```
 
+Build:
+```
+cargo +nightly build --release --target aarch64-unknown-linux-musl
+```
+
+For ARMv7 (e.g. I.MX6ULL):
 ```
 cargo +nightly build --release --target armv7-unknown-linux-musleabihf
+```
+
+Cross-compilation requires the appropriate linker in `.cargo/config.toml`:
+```toml
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "arm-linux-gnueabihf-gcc"
 ```
 
 ## Keybindings
 | Key       | Action                  | Notes                                |
 |-----------|-------------------------|--------------------------------------|
-| /         | Search                  | Search Files                         |
-| .         | Hide                    | Toggle visibility for hidden files   | 
+| /         | Search                  | Search files                         |
+| .         | Hide                    | Toggle visibility for hidden files   |
 | j   k     | Down / Up               | Cycle rows                           |
 | h         | Parent directory        | `cd ..` equivalent                   |
 | l   Enter | Enter dir / Select file | Resets selection to 0 on enter       |
-| Space     | Select current          | Toggle Selection                     |
+| Space     | Select current          | Toggle selection                     |
 | c   x     | Copy / Cut file         | To clipboard                         |
 | v         | Paste                   | From clipboard to current/target dir |
 | d         | Delete                  | Unrecoverable                        |
