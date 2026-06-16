@@ -25,6 +25,11 @@ enum InputContext { None, NewFile, NewDir, Rename, ConfirmDelete, Search }
 #[derive(PartialEq, Clone, Copy)]
 enum ConflictKind { File, Dir }
 
+pub enum ExitAction {
+    ChangeTo(String),
+    Stay,
+}
+
 struct PasteDialog {
     path:         PathBuf,
     kind:         ConflictKind,
@@ -73,6 +78,7 @@ pub struct App {
     preview_text:  String,
     view_dirty:    bool,
     should_quit:   bool,
+    stay_on_quit: bool,
 }
 
 impl App {
@@ -91,13 +97,14 @@ impl App {
             preview_text:  String::new(),
             view_dirty:    false,
             should_quit:   false,
+            stay_on_quit:  true
         };
         app.rebuild_view();
         app.spawn_preview();
         Ok(app)
     }
 
-    pub fn run(&mut self, tui: &mut Tui) -> Result<()> {
+    pub fn run(&mut self, tui: &mut Tui) -> Result<ExitAction> {
         let mut needs_redraw = true;
         loop {
             if self.poll_preview() { needs_redraw = true; }
@@ -134,7 +141,12 @@ impl App {
                 self.clamp_scroll(tui.size()?.height as usize);
             }
         }
-        Ok(())
+        if self.stay_on_quit {
+            Ok(ExitAction::Stay)
+        } else {
+            let path = self.fs.current_dir().to_string_lossy().into_owned();
+            Ok(ExitAction::ChangeTo(path))
+        }
     }
 
     fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
@@ -298,7 +310,8 @@ impl App {
                 self.search_query.clear();
                 self.reset_view();
             }
-            KeyCode::Char('q') => { self.should_quit = true; }
+            KeyCode::Char('q') => { self.should_quit = true; self.stay_on_quit = false}
+            KeyCode::Char('Q') => {self.should_quit = true}
             _ => {}
         }
     }
