@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 pub struct OperationUnitFS {
     pub operation: OperationFS,
     pub file_source: PathBuf,
-    pub file_destiny: PathBuf,
+    pub file_destination: PathBuf,
 }
 
 /// File System Operations supported

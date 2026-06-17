@@ -47,13 +47,13 @@ impl History {
         &mut self,
         operation: OperationFS,
         file_source: PathBuf,
-        file_destiny: PathBuf,
+        file_destination: PathBuf,
     ) -> io::Result<()> {
         if !self.available {
             return Ok(());
         }
 
-        let unit = OperationUnitFS { operation, file_source, file_destiny };
+        let unit = OperationUnitFS { operation, file_source, file_destination };
 
         let encoded = to_allocvec(&unit)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
