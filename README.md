@@ -54,5 +54,7 @@ linker = "arm-linux-gnueabihf-gcc"
 | d         | Delete                  | Unrecoverable                        |
 | n   m     | New file / New dir      | Enter name in input mode             |
 | r         | Rename selected         | Pre-fills name in input mode         |
-| u         | Undo last operation     | Most ops                             |
-| q   Esc   | Quit / Cancel input     | Escape hatches everywhere            |
+| u         | Undo last operation     | Couldn't undo delete                 |
+| Esc       | Cancel input            | Escape hatches everywhere            |
+| Q         | Quit                    | Returns to the launch directory      |
+| q         | Quit + cd               | cd to current browsed dir on exit    |
