@@ -89,13 +89,16 @@ impl App {
             list_pos:      0,
             scroll_offset: 0,
             marked:        None,
+            // search
             input_ctx:     InputContext::None,
             input_buf:     String::new(),
             show_hidden:   false,
             search_query:  String::new(),
+            // preview
             preview_rx:    None,
             preview_text:  String::new(),
             view_dirty:    false,
+            // quit option
             should_quit:   false,
             stay_on_quit:  true
         };
