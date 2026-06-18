@@ -20,16 +20,22 @@ use crate::ui::widget::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(PartialEq, Clone, Copy)]
-enum InputContext { None, NewFile, NewDir, Rename, ConfirmDelete, Search }
-
-#[derive(PartialEq, Clone, Copy)]
-enum ConflictKind { File, Dir }
-
-pub enum ExitAction {
-    ChangeTo(String),
-    Stay,
+enum InputContext { 
+    None, 
+    NewFile, 
+    NewDir, 
+    Rename, 
+    ConfirmDelete, 
+    Search 
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum ConflictKind { 
+    File, 
+    Dir 
+}
+
+// handle conflict
 struct PasteDialog {
     path:         PathBuf,
     kind:         ConflictKind,
@@ -64,19 +70,27 @@ impl PasteDialog {
     }
 }
 
+pub enum ExitAction {
+    ChangeTo(String),
+    Stay,
+}
+
 pub struct App {
     fs:            FileSystemCore,
     view:          Vec<FileEntry>,
     list_pos:      usize,
     scroll_offset: usize,
     marked:        Option<usize>,
+    // search
     input_ctx:     InputContext,
     input_buf:     String,
     show_hidden:   bool,
     search_query:  String,
+    // preview
     preview_rx:    Option<Receiver<String>>,
     preview_text:  String,
     view_dirty:    bool,
+    // quit option
     should_quit:   bool,
     stay_on_quit: bool,
 }
