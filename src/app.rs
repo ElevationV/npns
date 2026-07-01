@@ -536,8 +536,8 @@ fn read_file_preview(path: &Path) -> String {
 
     if path.is_symlink() {
         return std::fs::read_link(path)
-            .map(|t| format!("symlink → {}", t.display()))
-            .unwrap_or_else(|_| "symlink → ?".to_string());
+            .map(|t| format!("symlink -> {}", t.display()))
+            .unwrap_or_else(|_| "symlink -> ?".to_string());
     }
     if !path.symlink_metadata().map(|m| m.file_type().is_file()).unwrap_or(false) {
         return path.extension().and_then(|e| e.to_str())
